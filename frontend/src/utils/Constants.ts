@@ -23,12 +23,10 @@ function mobileTabletCheck() {
 const isMobileOrTablet = mobileTabletCheck();
 export default {
     SAMPLING_RATE: 16000,
-    DEFAULT_AUDIO_URL: `https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/${
-        isMobileOrTablet ? "jfk" : "ted_60_16k"
-    }.wav`,
-    DEFAULT_MODEL: "Xenova/whisper-tiny",
+    DEFAULT_AUDIO_URL: `https://cdn.openai.com/whisper/draft-20220913a/micro-machines.wav`,
+    DEFAULT_MODEL: "base",
     DEFAULT_SUBTASK: "transcribe",
-    DEFAULT_LANGUAGE: "english",
+    DEFAULT_LANGUAGE: "en",
     DEFAULT_QUANTIZED: isMobileOrTablet,
     DEFAULT_MULTILINGUAL: false,
 };

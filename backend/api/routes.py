@@ -10,7 +10,6 @@ import shutil
 from typing import Optional, Union, List
 from api.ollama_handler import generate_response
 from api.faster_transcription import FasterTranscriber, get_transcriber
-from api.xenova_handler import transcribe_with_xenova
 from api.whisper_handler import get_whisper_transcriber, transcribe_audio_chunk
 
 app = FastAPI()
@@ -122,113 +121,55 @@ async def extract_action_items(request: SummaryRequest, req: Request, limiter: N
 
 # File upload and transcription endpoints
 
-@app.post("/transcribe/file")
+@app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...), engine: str = Form("faster_whisper")):
-    # Transcribe an uploaded audio or video file
     try:
-        logger.info(f"Transcribing file: {file.filename} with engine: {engine}")
-        
-        # Create a temporary file to store the uploaded content
+        start_time = time()
         temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
+        temp_file_path = os.path.join(temp_dir, file.filename)
         
-        # Write the uploaded file to disk
-        with open(temp_path, "wb") as temp_file:
-            # Read and write in chunks to handle large files
-            content = await file.read()
-            temp_file.write(content)
+        # Save uploaded file to temp location
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
         
-        # Use the appropriate transcription engine
-        if engine == "xenova":
-            logger.info(f"Using Xenova engine for transcription")
-            transcript = transcribe_with_xenova(temp_path)
-        else:  # default to faster-whisper
-            logger.info(f"Using faster-whisper engine for transcription")
-            # Get the transcriber instance
-            transcriber = get_transcriber()
-            if not transcriber:
-                # Initialize with default settings if not already initialized
-                transcriber = get_transcriber({"model_name": "base"})
-            transcript = transcriber.transcribe_file(temp_path)
+        # Use faster-whisper (server-based) transcription
+        transcriber = FasterTranscriber()
+        result = await transcriber.transcribe_file(temp_file_path)
         
         # Clean up temporary files
         shutil.rmtree(temp_dir)
         
-        logger.info(f"Transcription completed. Transcript length: {len(transcript)}")
-        return {"status": "completed", "transcript": transcript}
+        logger.info(f"Transcription completed. Transcript length: {len(result)}")
+        return {"status": "completed", "transcript": result}
             
     except Exception as e:
         logger.error(f"Error transcribing file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/transcribe/screen")
-async def transcribe_screen_recording(file: UploadFile = File(...), engine: str = Form("faster_whisper")):
-    # Process a screen recording and extract audio for transcription
-    try:
-        logger.info(f"Processing screen recording: {file.filename} with engine: {engine}")
-        
-        # Create a temporary directory for the file
-        temp_dir = tempfile.mkdtemp()
-        video_path = os.path.join(temp_dir, file.filename)
-        
-        # Write the uploaded file to disk
-        with open(video_path, "wb") as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-        
-        logger.info(f"Screen recording saved to: {video_path}")
-        
-        try:
-            # Choose the transcription engine based on the request
-            if engine.lower() == "xenova":
-                logger.info(f"Transcribing with Xenova engine: {file.filename}")
-                transcript = transcribe_with_xenova(video_path)
-            else:  # Default to faster_whisper
-                logger.info(f"Transcribing with Faster Whisper engine: {file.filename}")
-                # Get or create a transcriber instance
-                transcriber = get_transcriber()
-                if not transcriber:
-                    transcriber = get_transcriber({"model_name": "base"})
-                    
-                transcript = transcriber.transcribe_file(video_path)
-            
-            logger.info(f"Screen recording transcription completed. Length: {len(transcript)}")
-            
-            # Return the transcription results
-            return {
-                "status": "completed", 
-                "transcript": transcript
-            }
-        finally:
-            # Clean up temporary files
-            shutil.rmtree(temp_dir)
-            
-    except Exception as e:
-        logger.error(f"Error transcribing screen recording: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/engines")
+@app.get("/engines")
 async def list_engines():
-    """List available transcription engines"""
+    """
+    List available transcription engines
+    """
     try:
+        # Check if faster-whisper is available (requires GPU and proper setup)
+        try:
+            transcriber = FasterTranscriber()
+            faster_whisper_available = True
+        except Exception as e:
+            logger.error(f"Error checking faster-whisper availability: {e}")
+            faster_whisper_available = False
+
+        engines = [
+            {
+                "id": "faster_whisper",
+                "name": "FasterWhisper (GPU)",
+                "available": faster_whisper_available,
+                "description": "Server-based transcription using faster-whisper. Requires GPU."
+            }
+        ]
         return {
-            "engines": [
-                {
-                    "id": "faster_whisper",
-                    "name": "Faster Whisper",
-                    "description": "High-performance implementation of OpenAI's Whisper model for standard transcription"
-                },
-                {
-                    "id": "whisper",
-                    "name": "OpenAI Whisper",
-                    "description": "Local OpenAI Whisper model with timestamps (for live transcription)"
-                },
-                {
-                    "id": "xenova",
-                    "name": "Xenova Whisper",
-                    "description": "Alternative implementation of Whisper model"
-                }
-            ],
+            "engines": engines,
             "default": "faster_whisper"
         }
     except Exception as e:
@@ -336,7 +277,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.error(f"Error processing audio chunk: {e}")
                     await websocket.send_text(json.dumps({"error": str(e)}))
         else:
-            # Use existing transcriber (faster-whisper or xenova) for non-timestamp mode
+            # Use existing transcriber (faster-whisper) for non-timestamp mode
             transcriber = get_transcriber()
             if not transcriber:
                 await websocket.send_text(json.dumps({

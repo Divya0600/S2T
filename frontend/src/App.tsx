@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { useTranscriber } from "./hooks/useTranscriber";
+import { useTranscriber, formatTimestamp } from "./hooks/useTranscriber";
 import Transcript from "./components/Transcript";
 import Progress from "./components/Progress";
 // Import components directly from their definition files
@@ -64,7 +64,7 @@ function App() {
   const transcriber = useTranscriber();
   const [currentStep, setCurrentStep] = useState(0);
   const [summary, setSummary] = useState('');
-  const [actionItems, setActionItems] = useState<ActionItem[]>([]);
+  const [actionItems, setActionItems] = useState<ActionItem[] | string>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isGeneratingActions, setIsGeneratingActions] = useState(false);
   const [error, setError] = useState('');
@@ -181,8 +181,18 @@ function App() {
         console.log('Received action items:', actionItemsText);
         
         // Process the action items, which could be HTML content
-        const parsedItems = parseActionItems(actionItemsText);
-        setActionItems(parsedItems);
+        try {
+          const result = parseActionItems(actionItemsText);
+          if (result && result.length > 0) {
+            setActionItems(result);
+          } else {
+            // If parsing returns empty array, use the raw text
+            setActionItems(actionItemsText || '');
+          }
+        } catch (e) {
+          // If parsing fails, just display the raw HTML
+          setActionItems(actionItemsText || '');
+        }
         
         // Update UI progress
         setCurrentStep(5); // Move to the final step
@@ -203,34 +213,42 @@ function App() {
   };
 
   const handleGenerateActionItems = async () => {
-    if (transcriber.output?.text) {
-      try {
-        setError('');
-        setIsGeneratingActions(true);
-        const items = await generateActionItems(transcriber.output.text);
-        setActionItems(items);
-        setCurrentStep(5);
-      } catch (error) {
-        setError('Failed to extract action items. Please try again.');
-        console.error('Action items extraction failed:', error);
-      } finally {
-        setIsGeneratingActions(false);
+    try {
+      setIsGeneratingActions(true);
+      setError('');
+      
+      const response = await axios.post(`${API_URL}/extract-action-items`, {
+        transcript: transcriber.output?.text || ''
+      });
+      
+      if (response.data && response.data.status === 'completed') {
+        console.log('Action items generated:', response.data);
+        try {
+          const parsedItems = parseActionItems(response.data.result);
+          if (parsedItems && parsedItems.length > 0) {
+            setActionItems(parsedItems);
+          } else {
+            setActionItems(response.data.result || '');
+          }
+        } catch (e) {
+          setActionItems(response.data.result || '');
+        }
+      } else {
+        throw new Error('Could not extract action items');
       }
+    } catch (e) {
+      setError(`Error extracting action items: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setIsGeneratingActions(false);
     }
   };
 
   // Add type for the line parameter in the action items parsing
-  const parseActionItems = (text: string) => {
-    // Check if the text is HTML content
-    if (text.includes('<div class="action-item">') || text.includes('<p class="task">')) {
-      // For HTML content, don't parse and just return the raw HTML
-      return text;
-    }
-
+  const parseActionItems = (text: string): ActionItem[] => {
     if (!text) return [];
-
-    // Split text into lines and filter out empty lines
-    return text.split('\n').filter(line => line.trim().length > 0).map(parseActionItemLine);
+    
+    const lines = text.split('\n').filter(line => line.trim() !== '');
+    return lines.map(parseActionItemLine).filter(Boolean) as ActionItem[];
   };
 
   const parseActionItemLine = (line: string) => {
@@ -256,9 +274,6 @@ function App() {
     return text;
   };
   
-  // Import formatTimestamp from useTranscriber
-  import { formatTimestamp } from "./hooks/useTranscriber";
-
   // Audio player reference
   const audioPlayerRef = useRef<HTMLAudioElement>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -736,9 +751,14 @@ function App() {
         {((actionItems && actionItems.length > 0) || (typeof actionItems === 'string' && actionItems)) && (
           <Card title="Action Items" icon={Icon('CheckSquare')} fullWidth>
             <div className="space-y-4">
-              {Array.isArray(actionItems) ? (
+              {typeof actionItems === 'string' ? (
+                // Display HTML action items
+                <div className="bg-gray-50 p-4 rounded-lg">
+                  <div dangerouslySetInnerHTML={{ __html: actionItems }}></div>
+                </div>
+              ) : (
                 // Display traditional action items array
-                actionItems.map((item, index) => (
+                actionItems.map((item: ActionItem, index: number) => (
                   <div 
                     key={index}
                     className="bg-gray-50 p-4 rounded-lg flex items-start"
@@ -750,11 +770,6 @@ function App() {
                     </div>
                   </div>
                 ))
-              ) : (
-                // Display HTML action items
-                <div className="bg-gray-50 p-4 rounded-lg">
-                  <div dangerouslySetInnerHTML={{ __html: actionItems }}></div>
-                </div>
               )}
               <div className="flex justify-end mt-4">
                 <button

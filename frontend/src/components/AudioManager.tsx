@@ -367,10 +367,10 @@ function SettingsModal(props: {
 
     const models = {
         // Original checkpoints
-        'Xenova/whisper-tiny': [41, 152],
-        'Xenova/whisper-base': [77, 291],
-        'Xenova/whisper-small': [249],
-        'Xenova/whisper-medium': [776],
+        'tiny': [41, 152],
+        'base': [77, 291],
+        'small': [249],
+        'medium': [776],
 
         // Distil Whisper (English-only)
         'distil-whisper/distil-medium.en': [402],

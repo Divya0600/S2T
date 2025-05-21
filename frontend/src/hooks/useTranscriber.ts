@@ -111,8 +111,20 @@ export function useTranscriber(): Transcriber {
     const [isLiveMode, setIsLiveMode] = useState(false);
     const [recordedMedia, setRecordedMedia] = useState<{ url: string, type: string } | null>(null);
     
-    // Engine selection state
-    const [engine, setEngine] = useState<string>("faster_whisper");
+    // Engine selection based on mode: faster-whisper for standard, whisper (OpenAI local) for live
+    const [engine, setEngineState] = useState<string>("faster_whisper");
+    
+    // Update engine based on live mode
+    useEffect(() => {
+        const newEngine = isLiveMode ? "whisper" : "faster_whisper";
+        console.log(`Setting engine to ${newEngine} based on isLiveMode=${isLiveMode}`);
+        setEngineState(newEngine);
+    }, [isLiveMode]);
+    
+    const setEngine = useCallback((newEngine: string) => {
+        console.log(`Changing engine from ${engine} to ${newEngine}`);
+        setEngineState(newEngine);
+    }, [engine]);
     
     // Model configuration states
     const [model, setModel] = useState<string>(Constants.DEFAULT_MODEL);
@@ -421,6 +433,12 @@ export function useTranscriber(): Transcriber {
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+                    console.log('WebSocket received:', {
+                        engine,
+                        hasText: !!data.text,
+                        hasSegments: !!data.segments,
+                        segmentsCount: data.segments?.length
+                    });
                     
                     // Handle error messages
                     if (data.error) {
@@ -481,7 +499,7 @@ export function useTranscriber(): Transcriber {
             
             setIsBusy(false);
         }
-    }, [model, language, engine, cleanupAudioResources]);
+    }, [model, language, engine]);
     
     // Function to clean up audio resources
     const cleanupAudioResources = useCallback(() => {
@@ -505,24 +523,64 @@ export function useTranscriber(): Transcriber {
         mediaRecorderRef.current = null;
     }, []);
     
-    const stopStreaming = useCallback(() => {
+    const stopStreaming = useCallback(async () => {
+        console.log('Stopping streaming, audioChunks:', audioChunksRef.current.length);
+        
+        // Save recording if we have audio chunks and we're in live mode
+        if (audioChunksRef.current.length > 0 && isLiveMode) {
+            try {
+                // Create a blob from recorded chunks based on the recorder type (audio/video)
+                const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+                const isVideo = mimeType.includes('video');
+                const blob = new Blob(audioChunksRef.current, { type: mimeType });
+                
+                console.log(`Created ${isVideo ? 'video' : 'audio'} blob: ${blob.size} bytes`);
+                
+                // Create a file from the blob
+                const fileName = `${isVideo ? 'screen' : 'audio'}-recording-${Date.now()}.webm`;
+                const file = new File([blob], fileName, { type: mimeType });
+                
+                // Create object URL for preview
+                const url = URL.createObjectURL(blob);
+                setRecordedMedia({ url, type: isVideo ? 'video' : 'audio' });
+                
+                console.log(`Live recording saved as ${fileName}`);
+                
+                // If we have transcript content, don't overwrite it with transcription
+                if (!transcript?.text) {
+                    // Transcribe the recording in background
+                    transcribeFile(file).catch(err => {
+                        console.error('Error transcribing saved recording:', err);
+                    });
+                }
+            } catch (err) {
+                console.error('Error saving live recording:', err);
+            }
+        }
+        
+        // Use cleanup function
+        cleanupAudioResources();
+        
         // Close WebSocket connection
         if (webSocketRef.current) {
             webSocketRef.current.close();
             webSocketRef.current = null;
         }
         
+        // Reset audio chunks array
+        audioChunksRef.current = [];
+        
         // Stop server-side transcription
-        axios.post('http://localhost:8000/transcriber/stop')
-            .then(() => {
-                console.log('Transcription stopped');
-                setIsBusy(false);
-                streamingCallbackRef.current = null;
-            })
-            .catch(error => {
-                console.error('Error stopping transcription:', error);
-            });
-    }, []);
+        try {
+            await axios.post('http://localhost:8000/transcriber/stop');
+            console.log('Transcription stopped');
+            streamingCallbackRef.current = null;
+        } catch (error) {
+            console.error('Error stopping transcription:', error);
+        } finally {
+            setIsBusy(false);
+        }
+    }, [isLiveMode, transcript, transcribeFile]);
     
     // Recording functions
     const startRecording = useCallback(async () => {
