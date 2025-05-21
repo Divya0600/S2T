@@ -1,0 +1,23 @@
+# API and web framework dependencies
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+pydantic==2.6.1
+websockets==11.0.3
+
+# Ollama API integration
+requests==2.31.0
+
+# Transcription engines
+faster-whisper>=0.9.0  # Primary transcription engine
+transformers>=4.35.0   # For Xenova Whisper integration
+torch>=2.0.0           # Required for transformers
+
+# Audio processing
+pyaudio==0.2.13        # For microphone access
+numpy>=1.20.0          # For array operations
+ffmpeg-python==0.2.0   # For video/screen recording processing
+
+# Utilities
+python-dotenv==1.0.0   # For environment variables
+tqdm>=4.65.0           # For progress bars
