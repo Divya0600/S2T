@@ -133,8 +133,18 @@ export function useTranscriber(): Transcriber {
     const [multilingual, setMultilingual] = useState<boolean>(Constants.DEFAULT_MULTILINGUAL);
     const [language, setLanguage] = useState<string>(Constants.DEFAULT_LANGUAGE);
     
-    // WebSocket for streaming transcription
+    // WebSocket reference for streaming audio
     const webSocketRef = useRef<WebSocket | null>(null);
+
+    // Clean up audio resources when component unmounts
+    useEffect(() => {
+        return () => {
+            if (webSocketRef.current) {
+                webSocketRef.current.close();
+            }
+        };
+    }, []);
+
     // Audio context and media recorder for live whisper transcription
     const audioContextRef = useRef<AudioContext | null>(null);
     const micStreamRef = useRef<MediaStream | null>(null);
@@ -336,9 +346,9 @@ export function useTranscriber(): Transcriber {
             // or if response.data was null.
             setIsBusy(false);
         }
-    }, [engine, setTranscript, setIsBusy]); // Added setTranscript and setIsBusy to dependencies for correctness
-    
-    // Start streaming audio to the WebSocket for real-time transcription
+    }, [engine]);
+
+    // Live streaming functionality
     const startStreaming = useCallback(async (updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, options?: {
         captureBothIO?: boolean;
         inputDevice?: string | number | null;
@@ -346,237 +356,73 @@ export function useTranscriber(): Transcriber {
     }) => {
         console.log('Starting streaming transcription with engine:', engine);
         
-        // Prevent starting multiple streams
-        if (webSocketRef.current) {
-            console.warn('WebSocket already active');
+        if (isBusy) {
+            console.log('Transcriber is busy, cannot start streaming');
             return;
         }
         
         setIsBusy(true);
+        streamingCallbackRef.current = updateCallback;
+        
+        // Close any existing WebSocket connection
+        if (webSocketRef.current) {
+            webSocketRef.current.close();
+        }
         
         try {
-            // First start the transcription service on the backend
-            const response = await fetch(`http://localhost:8000/transcriber/start`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    model_name: model,
-                    language: language || null,
-                    engine: engine,
-                }),
-            });
+            // Create a new WebSocket connection
+            const wsUrl = `ws://localhost:8000/transcriber/ws?engine=faster-whisper`;
+            webSocketRef.current = new WebSocket(wsUrl);
             
-            const data = await response.json();
-            console.log('Transcription service response:', data);
-            
-            if (data.status !== 'started' && data.status !== 'ready') {
-                throw new Error(`Failed to start transcription service: ${data.status}`);
-            }
-            
-            // Initialize the WebSocket connection
-            const ws = new WebSocket(`ws://localhost:8000/transcriber/ws`);
-            webSocketRef.current = ws;
-            
-            // WebSocket event handlers
-            ws.onopen = async () => {
+            webSocketRef.current.onopen = () => {
                 console.log('WebSocket connection established');
-                
-                // Send configuration to the WebSocket
-                const config = {
-                    engine: 'whisper', // Force whisper engine
-                    model_name: model,
-                    language: language || null
-                };
-                console.log('Sending WebSocket configuration:', config);
-                ws.send(JSON.stringify(config));
-                
-                // If using OpenAI Whisper, set up audio recording and streaming
-                if (engine === 'whisper') {
-                    try {
-                        console.log('Requesting microphone access...');
-                        const micStream = await navigator.mediaDevices.getUserMedia({ 
-                            audio: {
-                                echoCancellation: true,
-                                noiseSuppression: true,
-                                channelCount: 1
-                            } 
-                        });
-                        console.log('Microphone access granted:', micStream.getAudioTracks().length, 'audio tracks');
-                        micStreamRef.current = micStream;
-                        
-                        // Create audio context
-                        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-                        audioContextRef.current = audioContext;
-                        
-                        // Create media recorder with detailed debug
-                        const recorder = new MediaRecorder(micStream, {
-                            mimeType: 'audio/webm;codecs=opus',
-                            audioBitsPerSecond: 128000
-                        });
-                        console.log('Media recorder created with mime type:', recorder.mimeType);
-                        mediaRecorderRef.current = recorder;
-                        
-                        // Add clear data logging
-                        recorder.ondataavailable = (event) => {
-                            console.log('Audio data available:', event.data.size, 'bytes');
-                            if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                                event.data.arrayBuffer().then(buffer => {
-                                    console.log('Sending audio buffer of size:', buffer.byteLength);
-                                    ws.send(buffer);
-                                }).catch(err => {
-                                    console.error('Error processing audio chunk:', err);
-                                });
-                            }
-                        };
-                        
-                        // Start the recorder with smaller chunks for more frequent updates
-                        recorder.start(500); // Process in 500ms chunks
-                        console.log('Media recorder started');
-                        
-                        // Handle errors from the media recorder
-                        recorder.onerror = (event) => {
-                            console.error('MediaRecorder error:', event);
-                            setError('Error in audio recording');
-                        };
-                        
-                    } catch (err) {
-                        console.error('Error setting up audio streaming:', err);
-                        setError(`Failed to access microphone: ${err instanceof Error ? err.message : 'Unknown error'}`);
-                    }
-                }
-            };
-            
-            // Handle messages from the WebSocket
-            ws.onmessage = (event) => {
-                try {
-                    console.log('Raw WebSocket message received:', event.data);
-                    const data = JSON.parse(event.data);
-                    
-                    // Log detailed information about the received data
-                    console.log('Parsed WebSocket data:', {
-                        hasText: !!data.text,
-                        hasSegments: !!data.segments,
-                        segmentsCount: data.segments?.length,
-                        dataType: data.type || 'unknown'
-                    });
-                    
-                    // Handle error messages
-                    if (data.error) {
-                        const errorMsg = `WebSocket error: ${data.error}`;
-                        console.error(errorMsg);
-                        setError(errorMsg);
-                        return;
-                    }
-                    
-                    // Process transcription text
-                    if (data.text) {
-                        console.log('Transcript text received:', data.text);
-                        
-                        // Process segments for display
-                        const processedSegments = (data.segments || []).map((segment: any) => ({
-                            text: segment.text,
-                            start: segment.start || segment.timestamp?.[0],
-                            end: segment.end || segment.timestamp?.[1]
-                        }));
-                        
-                        if (processedSegments.length > 0) {
-                            console.log(`Processed ${processedSegments.length} segments`);
-                        }
-                        
-                        // Update local state
-                        setTranscript(prev => ({
-                            isBusy: true,
-                            text: data.text,
-                            chunks: processedSegments,
-                        }));
-                        
-                        // Call the update callback with the text and segments
-                        if (updateCallback) {
-                            updateCallback(data.text, processedSegments);
-                        }
-                    }
-                } catch (e) {
-                    const errorMsg = `Error processing WebSocket message: ${e instanceof Error ? e.message : String(e)}`;
-                    console.error(errorMsg, e);
-                    setError(errorMsg);
-                }
-            };
-            
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                setError('WebSocket connection error');
-            };
-            
-            ws.onclose = () => {
-                console.log('WebSocket connection closed');
-                cleanupAudioResources();
                 setIsBusy(false);
             };
             
-        } catch (error: any) {
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            const errorDetails = error.response ? 
-                `Status: ${error.response.status} - ${error.response.statusText}` : 
-                '';
-                
-            console.error('Error in streaming setup:', {
-                error: errorMessage,
-                details: errorDetails,
-                stack: error.stack
-            });
-            
-            setError(`Failed to set up streaming: ${errorMessage} ${errorDetails}`.trim());
-            
-            // Clean up resources
-            cleanupAudioResources();
-            
-            // Close the WebSocket connection if it exists
-            if (webSocketRef.current) {
+            webSocketRef.current.onmessage = (event) => {
                 try {
-                    if (webSocketRef.current.readyState === WebSocket.OPEN) {
-                        webSocketRef.current.close(1000, 'Setup error');
+                    const data = JSON.parse(event.data);
+                    if (data.text) {
+                        updateCallback(data.text, data.segments);
                     }
-                } catch (closeError) {
-                    console.error('Error closing WebSocket:', closeError);
+                } catch (error) {
+                    console.error('Error processing WebSocket message:', error);
                 }
+            };
+            
+            webSocketRef.current.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                setIsBusy(false);
+                streamingCallbackRef.current = null;
+            };
+            
+            webSocketRef.current.onclose = () => {
+                console.log('WebSocket connection closed');
+                setIsBusy(false);
+                streamingCallbackRef.current = null;
                 webSocketRef.current = null;
-            }
-            
+            };
+        } catch (error) {
+            console.error('Error setting up WebSocket:', error);
             setIsBusy(false);
-            
-            // Log the full error for debugging
-            if (process.env.NODE_ENV === 'development') {
-                console.error('Full error details:', error);
-            }
+            streamingCallbackRef.current = null;
+            return;
         }
-    }, [model, language, engine]);
-    
-    // Function to clean up audio resources
-    const cleanupAudioResources = useCallback(() => {
-        // Stop media recorder if active
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop();
-        }
-        
-        // Stop and close audio tracks
-        if (micStreamRef.current) {
-            micStreamRef.current.getTracks().forEach(track => track.stop());
-            micStreamRef.current = null;
-        }
-        
-        // Close audio context
-        if (audioContextRef.current) {
-            audioContextRef.current.close();
-            audioContextRef.current = null;
-        }
-        
-        mediaRecorderRef.current = null;
-    }, []);
-    
+    }, [engine]);
+
     const stopStreaming = useCallback(async () => {
-        console.log('Stopping streaming, audioChunks:', audioChunksRef.current.length);
+        console.log('Stopping streaming');
+        
+        if (webSocketRef.current) {
+            if (webSocketRef.current.readyState === WebSocket.OPEN) {
+                webSocketRef.current.close();
+            }
+            webSocketRef.current = null;
+        }
+        
+        streamingCallbackRef.current = null;
+        
+        console.log('Stopped streaming, audioChunks:', audioChunksRef.current.length);
         
         // Save recording if we have audio chunks and we're in live mode
         if (audioChunksRef.current.length > 0 && isLiveMode) {

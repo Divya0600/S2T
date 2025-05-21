@@ -319,20 +319,20 @@ function App() {
       return;
     }
 
-    console.log(`Attempting to start audio recording. withLiveTranscript (for Cpp mode): ${withLiveTranscript}`);
+    console.log(`Attempting to start audio recording with live transcript: ${withLiveTranscript}`);
     setError('');
     audioChunksRef.current = []; // Clear previous full recording chunks
     setLiveSegments([]);       // Clear previous live segments
     totalLiveStreamDurationRef.current = 0; // Reset live stream duration
 
-    setIsLiveMode(withLiveTranscript); 
-    setIsCppLiveActive(withLiveTranscript);
-
+    // Always use faster-whisper for both live and non-live modes
+    transcriber.setEngine('faster_whisper');
+    setIsLiveMode(withLiveTranscript);
+    
     if (withLiveTranscript) {
-      console.log('CppLiveMode active. Full transcription via useTranscriber might be separate.');
+      console.log('Live transcription mode enabled with faster-whisper');
     } else {
-      console.log('Standard recording mode. Setting transcriber engine for faster_whisper.');
-      transcriber.setEngine('faster_whisper');
+      console.log('Standard recording mode with faster-whisper');
     }
 
     transcriber.output = undefined;
@@ -341,37 +341,7 @@ function App() {
     setLiveTranscript(''); 
     setCurrentStep(1); 
 
-    const sendAudioChunkToCppEndpoint = async (audioBlob: Blob) => {
-      if (!isCppLiveActive || audioBlob.size === 0) return;
-      const formData = new FormData();
-      formData.append('file', audioBlob, 'live_chunk.wav');
-      try {
-        console.log(`[App.tsx] sendAudioChunkToCppEndpoint: Attempting to send chunk. Size: ${audioBlob.size}, API_URL: ${API_URL}`);
-        const response = await axios.post(`${API_URL}/api/transcribe-live-chunk`, formData, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-          timeout: 15000, 
-        });
-        console.log('[App.tsx] sendAudioChunkToCppEndpoint: Received response from backend:', JSON.stringify(response.data, null, 2));
-        if (response.data && response.data.segments && Array.isArray(response.data.segments)) {
-          const currentOffset = totalLiveStreamDurationRef.current;
-          let maxDurationInChunk = 0;
-          const newSegments = response.data.segments.map((seg: { text: string; start: string; end: string }) => {
-            const startSec = timeStringToSeconds(seg.start);
-            const endSec = timeStringToSeconds(seg.end);
-            if (endSec > maxDurationInChunk) maxDurationInChunk = endSec;
-            return { text: seg.text, start: currentOffset + startSec, end: currentOffset + endSec };
-          });
-          console.log('[App.tsx] sendAudioChunkToCppEndpoint: Processed newSegments:', JSON.stringify(newSegments, null, 2));
-          setLiveSegments(prev => [...prev, ...newSegments]);
-          console.log('[App.tsx] Live segments state supposedly updated via Cpp endpoint. Current liveSegments length should reflect this soon.');
-          totalLiveStreamDurationRef.current += (maxDurationInChunk > 0 ? maxDurationInChunk : (LIVE_CHUNK_INTERVAL_MS / 1000));
-        } else {
-          console.warn('No valid segments received from whisper.cpp endpoint:', response.data);
-        }
-      } catch (err) {
-        console.error('Error sending/processing live audio chunk with whisper.cpp endpoint:', err);
-      }
-    };
+    // WebSocket streaming is now handled by useTranscriber hook
 
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }})
     .then(stream => {
@@ -392,32 +362,26 @@ function App() {
       mediaRecorderRef.current.ondataavailable = (event: BlobEvent) => {
         console.log('[App.tsx] ondataavailable called. Chunk size:', event.data?.size);
         if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data); // Collect full recording regardless
-          if (isLiveMode) { // Use isLiveMode as it's more reliably reflecting the user's choice for the current recording session
-            console.log('[App.tsx] CppLiveActive is true, calling sendAudioChunkToCppEndpoint.');
-            sendAudioChunkToCppEndpoint(event.data);
-          }
+          audioChunksRef.current.push(event.data); // Collect full recording
         }
       };
 
       mediaRecorderRef.current.onstop = async () => {
-        console.log('MediaRecorder stopped. isCppLiveActive:', isCppLiveActive, 'withLiveTranscript (at start):', withLiveTranscript);
+        console.log('MediaRecorder stopped. isLiveMode:', isLiveMode, 'withLiveTranscript (at start):', withLiveTranscript);
         setIsRecording(false);
         const fullAudioBlob = new Blob(audioChunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'audio/webm' });
         console.log('Full audio recording available after stop, size:', fullAudioBlob.size);
+        
         if (fullAudioBlob.size > 0) {
           setAudioUrl(URL.createObjectURL(fullAudioBlob));
-          if (!withLiveTranscript) {
-            console.log('Standard recording finished. Sending to transcriber.transcribeFile.');
-            if (transcriber && typeof transcriber.transcribeFile === 'function') {
-              transcriber.transcribeFile(new File([fullAudioBlob], 'final_recording.webm', { type: fullAudioBlob.type }));
-            }
-          } else {
-            console.log('CppLiveMode recording finished. Full audio blob is also available.');
+          console.log('Sending recorded audio to transcriber.');
+          if (transcriber && typeof transcriber.transcribeFile === 'function') {
+            transcriber.transcribeFile(new File([fullAudioBlob], 'final_recording.webm', { type: fullAudioBlob.type }));
           }
         } else {
           console.warn('No audio data in audioChunksRef after recording stopped.');
         }
+        
         setCurrentStep(2);
         stream.getTracks().forEach(track => track.stop()); // Ensure stream is released
       };
@@ -426,7 +390,8 @@ function App() {
         const error = (event as any).error as DOMException | undefined;
         console.error('Audio MediaRecorder error:', error?.message || 'Unknown MediaRecorder error', event);
         setError(`Audio MediaRecorder error: ${error?.name || 'Unknown error'}`);
-        setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+        setIsRecording(false);
+        setIsLiveMode(false);
         stream.getTracks().forEach(track => track.stop());
       };
 
@@ -459,7 +424,7 @@ function App() {
       mediaRecorderRef.current.stop(); // Triggers 'onstop'
     } else {
       console.warn('MediaRecorder not recording or not initialized when stopAudioRecording called.');
-      setIsRecording(false); setIsCppLiveActive(false);
+      setIsRecording(false);
     }
     // Stream tracks are stopped in onstop or onerror.
   };
@@ -469,12 +434,16 @@ function App() {
       console.log('Already screen recording.');
       return;
     }
+    
+    console.log(`Starting screen recording with live transcript: ${withLiveTranscript}`);
     setIsScreenRecording(true);
     setError('');
     screenAudioChunksRef.current = [];
-    setLiveSegments([]); // Reset for screen recording live transcript if applicable
-    // transcriber.setEngine('whisper'); // Or faster_whisper, depending on preference for screen live
-    // setIsLiveMode(withLiveTranscript); // if screen recording also uses the same live mode logic
+    setLiveSegments([]);
+    
+    // Use faster-whisper for screen recording as well
+    transcriber.setEngine('faster-whisper');
+    setIsLiveMode(withLiveTranscript);
 
     console.log('Starting screen recording. Live transcript:', withLiveTranscript);
 
@@ -505,8 +474,7 @@ function App() {
       screenRecorder.ondataavailable = (event: BlobEvent) => {
         if (event.data.size > 0) {
           screenAudioChunksRef.current.push(event.data);
-          // If live transcription for screen recording is needed, send chunks here
-          // similar to sendAudioChunkToCppEndpoint, but likely to a different endpoint or with different handling
+          // WebSocket streaming is handled by useTranscriber hook
         }
       };
 
@@ -517,15 +485,14 @@ function App() {
         if (videoBlob.size > 0) {
           const videoFile = new File([videoBlob], 'screen_recording.webm', { type: videoBlob.type });
           console.log('Screen recording finished, blob size:', videoBlob.size);
-          // Here, you'd typically extract audio or send the video file for processing
-          // For now, similar to audio, we'll assume 'transcriber.transcribeFile' handles it if not live.
-          if (!withLiveTranscript || !isLiveMode) { // Or however you manage live for screen
-            transcriber.transcribeFile(videoFile); // This might need an audio-only file
-          } else {
-            console.log('Live screen recording finished.');
-            // transcriber.stopStreaming(); // if useTranscriber was used for screen live
+          
+          // Send the recorded video for transcription
+          if (transcriber && typeof transcriber.transcribeFile === 'function') {
+            transcriber.transcribeFile(videoFile);
           }
-          // setVideoUrl(URL.createObjectURL(videoBlob)); // If you want to play back the video
+          
+          // Set video URL for playback if needed
+          // setVideoUrl(URL.createObjectURL(videoBlob));
         }
         // Stop all tracks from combinedStream
         combinedStream.getTracks().forEach(track => track.stop());
