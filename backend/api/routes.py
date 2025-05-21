@@ -271,68 +271,37 @@ async def websocket_endpoint(websocket: WebSocket):
         # Get config from first message
         config_msg = await websocket.receive_text()
         config = json.loads(config_msg)
-        engine = config.get('engine', 'whisper')
-        model_name = config.get('model_name', 'base')
         
-        # For Whisper timestamps mode, we'll handle audio chunks directly
-        if engine == 'whisper':
-            # Initialize whisper transcriber
-            transcriber = get_whisper_transcriber(model_name)
+        # Force faster-whisper for live transcription
+        config['engine'] = 'faster_whisper'
+        
+        # Initialize transcriber with faster-whisper
+        transcriber = get_transcriber(config=config)
+        transcriber.start()
+        
+        # Process incoming audio chunks if needed or use internal mic capture
+        # ...
+        
+        # Send transcription results back
+        while True:
+            result = transcriber.get_latest_result(block=False)
+            if result:
+                # Format result for frontend
+                formatted_result = {
+                    "text": result.get("text", ""),
+                    "segments": [
+                        {"text": seg["text"], "start": seg.get("start"), "end": seg.get("end")} 
+                        for seg in result.get("segments", [])
+                    ],
+                    "timestamp": time()
+                }
+                await websocket.send_text(json.dumps(formatted_result))
             
-            # Process audio chunks and return transcripts with timestamps
-            while True:
-                # Receive audio chunk from WebSocket
-                audio_chunk = await websocket.receive_bytes()
-                
-                # No need to process empty chunks
-                if not audio_chunk:
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                try:
-                    # Process audio chunk with whisper
-                    result = transcribe_audio_chunk(
-                        audio_chunk, 
-                        model_name=model_name,
-                        language=config.get('language')
-                    )
-                    
-                    # Send the transcript with timestamps back to the client
-                    await websocket.send_text(json.dumps({
-                        "text": result.get("text", ""),
-                        "segments": result.get("segments", []),
-                        "timestamp": time()
-                    }))
-                except Exception as e:
-                    logger.error(f"Error processing audio chunk: {e}")
-                    await websocket.send_text(json.dumps({"error": str(e)}))
-        else:
-            # Use existing transcriber (faster-whisper) for non-timestamp mode
-            transcriber = get_transcriber()
-            if not transcriber:
-                await websocket.send_text(json.dumps({
-                    "error": "Transcriber not initialized. Call /transcriber/start first."
-                }))
-                await websocket.close()
-                return
+            await asyncio.sleep(0.1)  # Poll every 100ms
             
-            # This will run until the WebSocket disconnects
-            while True:
-                # Check for new transcription results
-                result = transcriber.get_latest_result(block=False)
-                if result:
-                    # Send the result to the WebSocket client
-                    await websocket.send_text(json.dumps({
-                        "text": result.get("text", ""),
-                        "segments": result.get("segments", []),
-                        "timestamp": time()
-                    }))
-                
-                # Poll for results every 100ms
-                await asyncio.sleep(0.1)
-    
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
+        # Cleanup transcription
     except Exception as e:
         logger.error(f"Error in WebSocket connection: {e}")
         try:

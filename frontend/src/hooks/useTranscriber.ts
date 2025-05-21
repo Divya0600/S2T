@@ -48,6 +48,7 @@ interface TranscriptionResult {
     transcript?: string;
     summary?: string;
     error?: string;
+    chunks?: { text: string; start?: number; end?: number; timestamp?: [number, number | null] }[];
 }
 
 export interface Transcriber {
@@ -294,59 +295,52 @@ export function useTranscriber(): Transcriber {
 
     // File transcription function
     const transcribeFile = useCallback(async (file: File): Promise<TranscriptionResult> => {
-        setIsBusy(true);
-        let transcriptText: string = ''; 
-        try {
-            console.log(`Transcribing file: ${file.name} with engine: ${engine}`);
-            
-            const formData = new FormData();
-            formData.append('file', file);
-            formData.append('engine', engine);
-            
-            const endpoint = file.type.startsWith('video/') 
-                ? 'http://localhost:8000/transcribe/screen'
-                : 'http://localhost:8000/transcribe/file';
-            
-            console.log(`Using endpoint: ${endpoint} for file: ${file.name}`);
-            
-            const response = await axios.post(endpoint, formData, {
-                headers: { 'Content-Type': 'multipart/form-data' },
-            });
-            
-            console.log('Transcription response:', response.data);
-            
-            if (response.data) {
-                transcriptText = response.data.transcript || '';
-                console.log('Transcript received, length:', transcriptText.length);
-                
-                setTranscript({
-                    isBusy: false, // Set isBusy false here upon successful data handling
-                    text: transcriptText,
-                    chunks: [],
-                });
-
-                if (response.data.error) {
-                    console.error('Transcription service returned an error:', response.data.error);
-                    return { error: response.data.error }; // isBusy was set to false by setTranscript
-                }
-                return { transcript: transcriptText }; // isBusy was set to false by setTranscript
-            } else {
-                console.error('No data received from transcription service.');
-                // isBusy will be set to false in finally block for this path
-                return { error: 'No data received from transcription service' };
-            }
-        } catch (error) {
-            console.error('Error transcribing file:', error);
-            if (axios.isAxiosError(error) && error.response && error.response.data && error.response.data.error) {
-                return { error: error.response.data.error };
-            }
-            return { error: 'Failed to transcribe file' };
-        } finally {
-            // This ensures isBusy is set to false if an error occurred before setTranscript(isBusy:false)
-            // or if response.data was null.
-            setIsBusy(false);
+      setIsBusy(true);
+      setTranscript({ text: '', chunks: [], isBusy: true }); // Reset transcript and indicate busy
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('engine', engine); // Use the current engine state
+        
+        const endpoint = 'http://localhost:8000/transcribe'; 
+        
+        console.log(`Transcribing file with ${engine} engine: ${file.name}`);
+        
+        const response = await axios.post(endpoint, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        
+        if (response.data && response.data.transcript !== undefined) {
+          const transcriptText = response.data.transcript || '';
+          const responseChunks = response.data.chunks || [];
+          
+          setTranscript({
+            isBusy: false,
+            text: transcriptText,
+            chunks: responseChunks,
+          });
+          
+          return { transcript: transcriptText, chunks: responseChunks };
+        } else {
+          console.error('No data or transcript in response from transcription service:', response.data);
+          setTranscript({ isBusy: false, text: '', chunks: [] });
+          return { error: 'No transcript data received from transcription service' };
         }
-    }, [engine]);
+      } catch (error) {
+        console.error('Error transcribing file:', error);
+        let errorMessage = 'Failed to transcribe file.';
+        if (axios.isAxiosError(error) && error.response) {
+          errorMessage = `Failed to transcribe file: ${error.response.status} ${error.response.data?.detail || error.message}`;
+        } else if (error instanceof Error) {
+          errorMessage = `Failed to transcribe file: ${error.message}`;
+        }
+        setTranscript({ isBusy: false, text: '', chunks: [] });
+        return { error: errorMessage };
+      } finally {
+        setIsBusy(false);
+      }
+    }, [engine, setTranscript]); // Ensure `engine` and `setTranscript` are in the dependency array
+
 
     // Live streaming functionality
     const startStreaming = useCallback(async (updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, options?: {
@@ -413,9 +407,10 @@ export function useTranscriber(): Transcriber {
     const stopStreaming = useCallback(async () => {
         console.log('Stopping streaming');
         
-        if (webSocketRef.current) {
-            if (webSocketRef.current.readyState === WebSocket.OPEN) {
-                webSocketRef.current.close();
+        const ws = webSocketRef.current;
+        if (ws) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.close();
             }
             webSocketRef.current = null;
         }
@@ -456,8 +451,6 @@ export function useTranscriber(): Transcriber {
             }
         }
         
-        // Use cleanup function
-        cleanupAudioResources();
         
         // Close WebSocket connection
         if (webSocketRef.current) {
