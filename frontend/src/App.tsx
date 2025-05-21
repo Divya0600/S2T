@@ -20,6 +20,7 @@ const Icon = (icon: keyof typeof LucideIcons, size = 20, className = '') => {
 // No need for LucideIcon type with direct imports
 
 const API_URL = 'http://localhost:8000';
+const LIVE_CHUNK_INTERVAL_MS = 3000; // Interval for sending live audio chunks (in milliseconds)
 
 interface ActionItem {
   task: string;
@@ -63,8 +64,15 @@ const ProgressSteps = ({ currentStep }: ProgressStepsProps) => {
 function App() {
   const transcriber = useTranscriber();
   const [currentStep, setCurrentStep] = useState(0);
+  type ActionItemType = {
+    task: string;
+    assignee: string;
+  };
+  
+  type ActionItemsState = ActionItemType[] | string | null;
+  
+  const [actionItems, setActionItems] = useState<ActionItemsState>(null);
   const [summary, setSummary] = useState('');
-  const [actionItems, setActionItems] = useState<ActionItem[] | string>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isGeneratingActions, setIsGeneratingActions] = useState(false);
   const [error, setError] = useState('');
@@ -77,6 +85,8 @@ function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const screenMediaRecorderRef = useRef<MediaRecorder | null>(null);
   const screenAudioChunksRef = useRef<Blob[]>([]);
+  const [isCppLiveActive, setIsCppLiveActive] = useState(false); // For whisper.cpp live transcription mode
+  const totalLiveStreamDurationRef = useRef<number>(0); // Tracks cumulative duration for live transcript timestamps
   
   // Audio device state and fetching logic removed as we now use the default system audio device.
 
@@ -213,31 +223,31 @@ function App() {
   };
 
   const handleGenerateActionItems = async () => {
+    if (!transcriber.output?.text) {
+      setError('No transcript available to generate action items');
+      return;
+    }
+    
+    setIsGeneratingActions(true);
+    setError('');
+    
     try {
-      setIsGeneratingActions(true);
-      setError('');
-      
-      const response = await axios.post(`${API_URL}/extract-action-items`, {
-        transcript: transcriber.output?.text || ''
+      const response = await axios.post<ActionItemType[] | string>(`${API_URL}/generate-action-items`, {
+        text: transcriber.output.text
       });
       
-      if (response.data && response.data.status === 'completed') {
-        console.log('Action items generated:', response.data);
-        try {
-          const parsedItems = parseActionItems(response.data.result);
-          if (parsedItems && parsedItems.length > 0) {
-            setActionItems(parsedItems);
-          } else {
-            setActionItems(response.data.result || '');
-          }
-        } catch (e) {
-          setActionItems(response.data.result || '');
-        }
+      // Check if the response is an array of action items or HTML
+      if (Array.isArray(response.data)) {
+        setActionItems(response.data);
+      } else if (typeof response.data === 'string') {
+        setActionItems(response.data);
       } else {
-        throw new Error('Could not extract action items');
+        setError('Unexpected response format from server');
       }
-    } catch (e) {
-      setError(`Error extracting action items: ${e instanceof Error ? e.message : String(e)}`);
+    } catch (error) {
+      console.error('Error generating action items:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setError(`Failed to generate action items: ${errorMessage}`);
     } finally {
       setIsGeneratingActions(false);
     }
@@ -274,214 +284,283 @@ function App() {
     return text;
   };
   
-  // Audio player reference
   const audioPlayerRef = useRef<HTMLAudioElement>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
 
-  // Function to start audio recording with an optional live transcript parameter
-  const startAudioRecording = (withLiveTranscript: boolean) => {
-    // First, check if we're already recording
-    if (isRecording) {
-      console.log('Already recording audio');
-      return;
+  // Helper function to convert HH:MM:SS.mmm to seconds
+  const timeStringToSeconds = (timeStr: string): number => {
+    if (!timeStr || typeof timeStr !== 'string') {
+      console.warn(`Invalid time string input: ${timeStr}`);
+      return 0;
     }
-    
-    // Set the live mode based on the parameter
-    setIsLiveMode(withLiveTranscript);
-    
-    // Reset transcript and recording state
-    transcriber.output = undefined;
-    setActionItems([]);
-    setSummary('');
-    setLiveTranscript('');
-    setLiveSegments([]);
-    
-    console.log(`Starting audio recording. Live transcript: ${withLiveTranscript ? 'ON' : 'OFF'}`);
-    
-    // Request audio recording permission and set up MediaRecorder
-    navigator.mediaDevices
-      .getUserMedia({ audio: true })
-      .then((stream) => {
-        // Store the stream in the ref for later use
-        const options = { mimeType: 'audio/webm' };
-        const mediaRecorder = new MediaRecorder(stream, options);
-        mediaRecorderRef.current = mediaRecorder;
-        audioChunksRef.current = [];
-        
-        // If we're in live mode, start the streaming transcription
-        if (withLiveTranscript) {
-          console.log('Starting streaming transcription with Whisper');
-          // Set the engine to 'whisper' for live transcription with timestamps
-          transcriber.setEngine('whisper');
-          
-          transcriber.startStreaming((text, segments) => {
-            // This callback will be called with every new transcript update
-            setLiveTranscript(text);
-            if (segments) {
-              setLiveSegments(segments);
-            }
-          });
-        } else {
-          // Use faster-whisper for standard transcription
-          transcriber.setEngine('faster_whisper');
-        }
-        
-        // Set up event handlers
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) {
-            audioChunksRef.current.push(e.data);
-            console.log(`Recorded chunk: ${e.data.size} bytes`);
-          }
-        };
-        
-        // Start recording
-        mediaRecorder.start(1000); // Collect in 1-second chunks
-        setIsRecording(true);
-        setCurrentStep(2); // Move to the recording step in the UI
-        
-        console.log('MediaRecorder started, format:', options.mimeType);
-      })
-      .catch((error) => {
-        console.error('Error accessing microphone:', error);
-        alert(`Error accessing microphone: ${error.message}`);
-      });
+    const parts = timeStr.split(':');
+    if (parts.length !== 3) {
+      console.warn(`Invalid time string format: ${timeStr}`);
+      return 0;
+    }
+    try {
+      const h = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      const sMs = parseFloat(parts[2]);
+      if (isNaN(h) || isNaN(m) || isNaN(sMs)) {
+        console.warn(`Non-numeric part in time string: ${timeStr}`);
+        return 0;
+      }
+      return (h * 3600) + (m * 60) + sMs;
+    } catch (e) {
+      console.error(`Error parsing time string ${timeStr}:`, e);
+      return 0;
+    }
   };
 
-  const stopAudioRecording = async () => {
-    if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      
-      // We need to create a new function for ondataavailable that will execute when all data is available
-      mediaRecorderRef.current.onstop = () => {
-        // Create audio blob and send to transcriber
-        if (audioChunksRef.current.length > 0) {
-          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-          const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
-          
-          // Create URL for audio playback
-          const url = URL.createObjectURL(audioBlob);
-          setAudioUrl(url);
-          
-          // If in live mode, stop streaming and finalize transcript
-          if (isLiveMode) {
-            transcriber.stopStreaming();
-          } else {
-            // If not in live mode, transcribe the recorded audio
-            transcriber.transcribeFile(audioFile);
+  const startAudioRecording = (withLiveTranscript: boolean): void => {
+    if (isRecording) {
+      console.log('Already recording audio. Ignoring request.');
+      return;
+    }
+
+    console.log(`Attempting to start audio recording. withLiveTranscript (for Cpp mode): ${withLiveTranscript}`);
+    setError('');
+    audioChunksRef.current = []; // Clear previous full recording chunks
+    setLiveSegments([]);       // Clear previous live segments
+    totalLiveStreamDurationRef.current = 0; // Reset live stream duration
+
+    setIsLiveMode(withLiveTranscript); 
+    setIsCppLiveActive(withLiveTranscript);
+
+    if (withLiveTranscript) {
+      console.log('CppLiveMode active. Full transcription via useTranscriber might be separate.');
+    } else {
+      console.log('Standard recording mode. Setting transcriber engine for faster_whisper.');
+      transcriber.setEngine('faster_whisper');
+    }
+
+    transcriber.output = undefined;
+    setActionItems([]); 
+    setSummary('');       
+    setLiveTranscript(''); 
+    setCurrentStep(1); 
+
+    const sendAudioChunkToCppEndpoint = async (audioBlob: Blob) => {
+      if (!isCppLiveActive || audioBlob.size === 0) return;
+      const formData = new FormData();
+      formData.append('file', audioBlob, 'live_chunk.wav');
+      try {
+        console.log(`[App.tsx] sendAudioChunkToCppEndpoint: Attempting to send chunk. Size: ${audioBlob.size}, API_URL: ${API_URL}`);
+        const response = await axios.post(`${API_URL}/api/transcribe-live-chunk`, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 15000, 
+        });
+        console.log('[App.tsx] sendAudioChunkToCppEndpoint: Received response from backend:', JSON.stringify(response.data, null, 2));
+        if (response.data && response.data.segments && Array.isArray(response.data.segments)) {
+          const currentOffset = totalLiveStreamDurationRef.current;
+          let maxDurationInChunk = 0;
+          const newSegments = response.data.segments.map((seg: { text: string; start: string; end: string }) => {
+            const startSec = timeStringToSeconds(seg.start);
+            const endSec = timeStringToSeconds(seg.end);
+            if (endSec > maxDurationInChunk) maxDurationInChunk = endSec;
+            return { text: seg.text, start: currentOffset + startSec, end: currentOffset + endSec };
+          });
+          console.log('[App.tsx] sendAudioChunkToCppEndpoint: Processed newSegments:', JSON.stringify(newSegments, null, 2));
+          setLiveSegments(prev => [...prev, ...newSegments]);
+          console.log('[App.tsx] Live segments state supposedly updated via Cpp endpoint. Current liveSegments length should reflect this soon.');
+          totalLiveStreamDurationRef.current += (maxDurationInChunk > 0 ? maxDurationInChunk : (LIVE_CHUNK_INTERVAL_MS / 1000));
+        } else {
+          console.warn('No valid segments received from whisper.cpp endpoint:', response.data);
+        }
+      } catch (err) {
+        console.error('Error sending/processing live audio chunk with whisper.cpp endpoint:', err);
+      }
+    };
+
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }})
+    .then(stream => {
+      console.log('Microphone access granted.');
+      const options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 128000 };
+      let recorder;
+      try {
+        recorder = new MediaRecorder(stream, options);
+      } catch (e) {
+        console.error('Error creating MediaRecorder:', e);
+        setError(`Failed to initialize recording: ${e instanceof Error ? e.message : 'Unknown error'}`);
+        stream.getTracks().forEach(track => track.stop());
+        setIsCppLiveActive(false); setIsLiveMode(false); setIsRecording(false);
+        return;
+      }
+      mediaRecorderRef.current = recorder;
+
+      mediaRecorderRef.current.ondataavailable = (event: BlobEvent) => {
+        console.log('[App.tsx] ondataavailable called. Chunk size:', event.data?.size);
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data); // Collect full recording regardless
+          if (isLiveMode) { // Use isLiveMode as it's more reliably reflecting the user's choice for the current recording session
+            console.log('[App.tsx] CppLiveActive is true, calling sendAudioChunkToCppEndpoint.');
+            sendAudioChunkToCppEndpoint(event.data);
           }
         }
-        
-        setIsRecording(false);
       };
-      
-      // Stop all tracks
-      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+
+      mediaRecorderRef.current.onstop = async () => {
+        console.log('MediaRecorder stopped. isCppLiveActive:', isCppLiveActive, 'withLiveTranscript (at start):', withLiveTranscript);
+        setIsRecording(false);
+        const fullAudioBlob = new Blob(audioChunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'audio/webm' });
+        console.log('Full audio recording available after stop, size:', fullAudioBlob.size);
+        if (fullAudioBlob.size > 0) {
+          setAudioUrl(URL.createObjectURL(fullAudioBlob));
+          if (!withLiveTranscript) {
+            console.log('Standard recording finished. Sending to transcriber.transcribeFile.');
+            if (transcriber && typeof transcriber.transcribeFile === 'function') {
+              transcriber.transcribeFile(new File([fullAudioBlob], 'final_recording.webm', { type: fullAudioBlob.type }));
+            }
+          } else {
+            console.log('CppLiveMode recording finished. Full audio blob is also available.');
+          }
+        } else {
+          console.warn('No audio data in audioChunksRef after recording stopped.');
+        }
+        setCurrentStep(2);
+        stream.getTracks().forEach(track => track.stop()); // Ensure stream is released
+      };
+
+      mediaRecorderRef.current.onerror = (event: Event) => {
+        const error = (event as any).error as DOMException | undefined;
+        console.error('Audio MediaRecorder error:', error?.message || 'Unknown MediaRecorder error', event);
+        setError(`Audio MediaRecorder error: ${error?.name || 'Unknown error'}`);
+        setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      try {
+        if (withLiveTranscript) { 
+          mediaRecorderRef.current.start(LIVE_CHUNK_INTERVAL_MS);
+          console.log(`MediaRecorder started for CppLiveMode with ${LIVE_CHUNK_INTERVAL_MS}ms timeslice.`);
+        } else {
+          mediaRecorderRef.current.start();
+          console.log('MediaRecorder started for standard recording.');
+        }
+        setIsRecording(true);
+      } catch (e) {
+        console.error('Error starting MediaRecorder:', e);
+        setError(`Failed to start recording: ${e instanceof Error ? e.message : 'Unknown error'}`);
+        stream.getTracks().forEach(track => track.stop());
+        setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+      }
+    })
+    .catch(err => {
+      console.error('Failed to get user media (microphone):', err);
+      setError('Could not access microphone. Please check permissions.');
+      setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+    });
+  };
+
+  const stopAudioRecording = (): void => {
+    console.log('stopAudioRecording called. Current state:', mediaRecorderRef.current?.state);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop(); // Triggers 'onstop'
+    } else {
+      console.warn('MediaRecorder not recording or not initialized when stopAudioRecording called.');
+      setIsRecording(false); setIsCppLiveActive(false);
     }
+    // Stream tracks are stopped in onstop or onerror.
   };
 
   const startScreenRecording = async (withLiveTranscript: boolean) => {
-    try {
-      console.log('Starting screen recording with live transcription:', withLiveTranscript);
-      
-      // Request screen sharing with system audio
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({ 
-        video: { 
-          displaySurface: 'monitor',
-          frameRate: { ideal: 30 },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        },
-        audio: true // Try to capture system audio
-      });
-      
-      console.log('Screen stream obtained. Audio tracks:', displayStream.getAudioTracks().length);
-      
-      // Always capture microphone audio too
-      const audioStream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false
-        } 
-      });
-      
-      console.log('Microphone stream obtained. Audio tracks:', audioStream.getAudioTracks().length);
-      
-      // Combine the streams (both screen video, system audio, and microphone audio)
-      const combinedStream = new MediaStream();
-      
-      // Add all tracks from both streams
-      displayStream.getTracks().forEach(track => {
-        console.log(`Adding track: ${track.kind} from screen capture`);
-        combinedStream.addTrack(track);
-      });
-      
-      audioStream.getTracks().forEach(track => {
-        console.log(`Adding track: ${track.kind} from microphone`);
-        combinedStream.addTrack(track);
-      });
-      
-      console.log('Combined stream created with tracks:', 
-        combinedStream.getVideoTracks().length, 'video,',
-        combinedStream.getAudioTracks().length, 'audio');
-      
-      // Create media recorder with higher bitrate for better quality
-      const mediaRecorder = new MediaRecorder(combinedStream, {
-        mimeType: 'video/webm;codecs=vp9,opus',
-        videoBitsPerSecond: 3000000 // 3 Mbps
-      });
-      
-      screenMediaRecorderRef.current = mediaRecorder;
-      screenAudioChunksRef.current = [];
+    if (isScreenRecording) {
+      console.log('Already screen recording.');
+      return;
+    }
+    setIsScreenRecording(true);
+    setError('');
+    screenAudioChunksRef.current = [];
+    setLiveSegments([]); // Reset for screen recording live transcript if applicable
+    // transcriber.setEngine('whisper'); // Or faster_whisper, depending on preference for screen live
+    // setIsLiveMode(withLiveTranscript); // if screen recording also uses the same live mode logic
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          console.log(`Received data chunk: ${e.data.size} bytes`);
-          screenAudioChunksRef.current.push(e.data);
+    console.log('Starting screen recording. Live transcript:', withLiveTranscript);
+
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: 'monitor', frameRate: { ideal: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: true // Capture system audio
+      });
+
+      const audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+
+      const combinedStream = new MediaStream();
+      displayStream.getTracks().forEach(track => combinedStream.addTrack(track));
+      audioStream.getTracks().forEach(track => combinedStream.addTrack(track));
+
+      console.log('Combined stream for screen recording created. Video:', combinedStream.getVideoTracks().length, 'Audio:', combinedStream.getAudioTracks().length);
+
+      const recorderOptions = {
+        mimeType: 'video/webm;codecs=vp9,opus',
+        videoBitsPerSecond: 3000000, // 3 Mbps for video
+        audioBitsPerSecond: 128000,  // 128 kbps for audio
+      };
+      const screenRecorder = new MediaRecorder(combinedStream, recorderOptions);
+      screenMediaRecorderRef.current = screenRecorder;
+
+      screenRecorder.ondataavailable = (event: BlobEvent) => {
+        if (event.data.size > 0) {
+          screenAudioChunksRef.current.push(event.data);
+          // If live transcription for screen recording is needed, send chunks here
+          // similar to sendAudioChunkToCppEndpoint, but likely to a different endpoint or with different handling
         }
       };
 
-      // Start recording - capture data every second
-      mediaRecorder.start(1000);
-      console.log('Media recorder started');
+      screenRecorder.onstop = () => {
+        console.log('Screen recorder stopped.');
+        setIsScreenRecording(false);
+        const videoBlob = new Blob(screenAudioChunksRef.current, { type: 'video/webm' });
+        if (videoBlob.size > 0) {
+          const videoFile = new File([videoBlob], 'screen_recording.webm', { type: videoBlob.type });
+          console.log('Screen recording finished, blob size:', videoBlob.size);
+          // Here, you'd typically extract audio or send the video file for processing
+          // For now, similar to audio, we'll assume 'transcriber.transcribeFile' handles it if not live.
+          if (!withLiveTranscript || !isLiveMode) { // Or however you manage live for screen
+            transcriber.transcribeFile(videoFile); // This might need an audio-only file
+          } else {
+            console.log('Live screen recording finished.');
+            // transcriber.stopStreaming(); // if useTranscriber was used for screen live
+          }
+          // setVideoUrl(URL.createObjectURL(videoBlob)); // If you want to play back the video
+        }
+        // Stop all tracks from combinedStream
+        combinedStream.getTracks().forEach(track => track.stop());
+      };
 
-      if (withLiveTranscript) {
-        console.log('Starting live transcription');
-        // Start streaming for live transcription with device options
-        transcriber.startStreaming(setLiveTranscript, {});
-      }
-    } catch (error) {
-      console.error('Error starting screen recording:', error);
+      screenRecorder.onerror = (event: Event) => {
+        const error = (event as any).error as DOMException | undefined;
+        console.error('Screen recorder error:', error?.message || 'Unknown MediaRecorder error', event);
+        setError(`Screen recorder error: ${error?.name || 'Unknown error'}`);
+        setIsScreenRecording(false);
+        combinedStream.getTracks().forEach(track => track.stop());
+      };
+      
+      screenRecorder.start(1000); // Collect data every second, or longer for live chunks
+      console.log('Screen recorder started.');
+      // if (withLiveTranscript) {
+      //   transcriber.startStreaming(setLiveTranscript, {}); // If using useTranscriber for screen live
+      // }
+
+    } catch (err) {
+      console.error('Error starting screen recording:', err);
+      setError('Failed to start screen recording. Check permissions.');
       setIsScreenRecording(false);
     }
   };
 
-  const stopScreenRecording = async () => {
-    if (screenMediaRecorderRef.current) {
-      screenMediaRecorderRef.current.stop();
-      screenMediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      
-      // Create video blob and extract audio
-      if (screenAudioChunksRef.current.length > 0) {
-        const videoBlob = new Blob(screenAudioChunksRef.current, { type: 'video/webm' });
-        const videoFile = new File([videoBlob], 'screen-recording.webm', { type: 'video/webm' });
-        
-        // For screen recording, we need to extract audio and send for transcription
-        // In a real app, you'd use a library to extract audio or send the video directly
-        // to a backend that can extract the audio
-        
-        // If in live mode, stop streaming and finalize transcript
-        if (isLiveMode) {
-          transcriber.stopStreaming();
-        } else {
-          // In a real implementation, you would extract audio first
-          // For now, we'll send the video file directly to demonstrate
-          transcriber.transcribeFile(videoFile);
-        }
-      }
-
+  const stopScreenRecording = (): void => {
+    console.log('stopScreenRecording called. Current state:', screenMediaRecorderRef.current?.state);
+    if (screenMediaRecorderRef.current && screenMediaRecorderRef.current.state === 'recording') {
+      screenMediaRecorderRef.current.stop(); // Triggers 'onstop'
+    } else {
+      console.warn('Screen recorder not recording or not initialized.');
       setIsScreenRecording(false);
     }
+    // Stream tracks are stopped in onstop or onerror.
   };
 
   // Save Functions
@@ -496,17 +575,42 @@ function App() {
   };
 
   const saveActionItems = () => {
-    const actionItemsText = actionItems.map(item => 
-      `Task: ${item.task}\nAssignee: ${item.assignee}\n\n`
-    ).join('');
+    if (!actionItems) {
+      setError('No action items to save');
+      return;
+    }
+
+    let content = '';
     
-    const element = document.createElement("a");
-    const file = new Blob([actionItemsText], { type: 'text/plain' });
-    element.href = URL.createObjectURL(file);
-    element.download = "action_items.txt";
-    document.body.appendChild(element);
-    element.click();
-    document.body.removeChild(element);
+    if (typeof actionItems === 'string') {
+      // If actionItems is a string (HTML), create a text version
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = actionItems;
+      content = tempDiv.textContent || tempDiv.innerText || '';
+    } else if (Array.isArray(actionItems)) {
+      // If actionItems is an array of ActionItemType
+      content = actionItems.map(item => 
+        `Task: ${item.task}\nAssignee: ${item.assignee}\n\n`
+      ).join('');
+    }
+    
+    if (!content) {
+      setError('No content to save');
+      return;
+    }
+    
+    try {
+      const element = document.createElement("a");
+      const file = new Blob([content], { type: 'text/plain' });
+      element.href = URL.createObjectURL(file);
+      element.download = "action_items.txt";
+      document.body.appendChild(element);
+      element.click();
+      document.body.removeChild(element);
+    } catch (error) {
+      console.error('Error saving action items:', error);
+      setError('Failed to save action items');
+    }
   };
 
   return (
@@ -663,6 +767,17 @@ function App() {
         {((isRecording || isScreenRecording) && isLiveMode) && (
           <Card title="Live Transcript with Timestamps" icon={Icon('Mic')} fullWidth>
             <div className="max-h-80 overflow-y-auto my-2 p-4 bg-gray-50 rounded-lg">
+              {/* Debug info */}
+              <div className="mb-2 p-2 bg-gray-100 text-xs rounded">
+                <div className="grid grid-cols-2 gap-1">
+                  <div>Live segments: <span className="font-mono">{liveSegments.length || 0}</span></div>
+                  <div>Text length: <span className="font-mono">{liveTranscript?.length || 0}</span></div>
+                  <div>Recording: <span className="font-mono">{isRecording ? 'Yes' : 'No'}</span></div>
+                  <div>Live mode: <span className="font-mono">{isLiveMode ? 'Yes' : 'No'}</span></div>
+                  <div>Engine: <span className="font-mono">{isLiveMode && (isRecording || isScreenRecording) ? 'whisper.cpp (live)' : transcriber.engine}</span></div>
+                </div>
+              </div>
+              
               {liveSegments.length > 0 ? (
                 <div className="space-y-2">
                   {liveSegments.map((segment, index) => (
@@ -671,12 +786,19 @@ function App() {
                         {segment.start !== undefined ? formatTimestamp(segment.start) : '00:00:00'} 
                         {segment.end !== undefined ? ` - ${formatTimestamp(segment.end)}` : ''}
                       </div>
-                      <div>{segment.text}</div>
+                      <div className="text-gray-800">{segment.text}</div>
                     </div>
                   ))}
                 </div>
+              ) : liveTranscript ? (
+                <div className="whitespace-pre-wrap text-gray-800">{liveTranscript}</div>
               ) : (
-                <div className="whitespace-pre-wrap">{liveTranscript}</div>
+                <div className="text-gray-500 italic flex items-center justify-center h-20">
+                  <div className="flex items-center">
+                    <div className="w-2 h-2 bg-blue-500 rounded-full mr-2 animate-pulse"></div>
+                    <span>Listening for speech...</span>
+                  </div>
+                </div>
               )}
             </div>
           </Card>
@@ -748,7 +870,7 @@ function App() {
         )}
 
         {/* Action Items Display - Either from parsed actionItems array or raw HTML */}
-        {((actionItems && actionItems.length > 0) || (typeof actionItems === 'string' && actionItems)) && (
+        {actionItems && (
           <Card title="Action Items" icon={Icon('CheckSquare')} fullWidth>
             <div className="space-y-4">
               {typeof actionItems === 'string' ? (
@@ -758,18 +880,20 @@ function App() {
                 </div>
               ) : (
                 // Display traditional action items array
-                actionItems.map((item: ActionItem, index: number) => (
-                  <div 
-                    key={index}
-                    className="bg-gray-50 p-4 rounded-lg flex items-start"
-                  >
-                    {Icon('CheckSquare', 20, "w-5 h-5 text-[#5236ab] mt-1 mr-3")}
-                    <div>
-                      <p className="font-medium text-gray-900">{item.task}</p>
-                      <p className="text-gray-600">Assignee: {item.assignee}</p>
+                <>
+                  {Array.isArray(actionItems) && actionItems.map((item, index) => (
+                    <div 
+                      key={index}
+                      className="bg-gray-50 p-4 rounded-lg flex items-start"
+                    >
+                      {Icon('CheckSquare', 20, "w-5 h-5 text-[#5236ab] mt-1 mr-3")}
+                      <div>
+                        <p className="font-medium text-gray-900">{item.task}</p>
+                        <p className="text-gray-600">Assignee: {item.assignee}</p>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  ))}
+                </>
               )}
               <div className="flex justify-end mt-4">
                 <button

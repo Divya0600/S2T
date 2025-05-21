@@ -384,47 +384,66 @@ export function useTranscriber(): Transcriber {
                 console.log('WebSocket connection established');
                 
                 // Send configuration to the WebSocket
-                ws.send(JSON.stringify({
-                    engine: engine,
+                const config = {
+                    engine: 'whisper', // Force whisper engine
                     model_name: model,
                     language: language || null
-                }));
+                };
+                console.log('Sending WebSocket configuration:', config);
+                ws.send(JSON.stringify(config));
                 
                 // If using OpenAI Whisper, set up audio recording and streaming
                 if (engine === 'whisper') {
                     try {
-                        console.log('Setting up audio for Whisper streaming');
-                        
-                        // Get microphone access
-                        const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        console.log('Requesting microphone access...');
+                        const micStream = await navigator.mediaDevices.getUserMedia({ 
+                            audio: {
+                                echoCancellation: true,
+                                noiseSuppression: true,
+                                channelCount: 1
+                            } 
+                        });
+                        console.log('Microphone access granted:', micStream.getAudioTracks().length, 'audio tracks');
                         micStreamRef.current = micStream;
                         
                         // Create audio context
-                        const audioContext = new AudioContext();
+                        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
                         audioContextRef.current = audioContext;
                         
-                        // Create media recorder for sending audio chunks
+                        // Create media recorder with detailed debug
                         const recorder = new MediaRecorder(micStream, {
-                            mimeType: 'audio/webm'
+                            mimeType: 'audio/webm;codecs=opus',
+                            audioBitsPerSecond: 128000
                         });
+                        console.log('Media recorder created with mime type:', recorder.mimeType);
                         mediaRecorderRef.current = recorder;
                         
-                        // Start recording and sending chunks
+                        // Add clear data logging
                         recorder.ondataavailable = (event) => {
+                            console.log('Audio data available:', event.data.size, 'bytes');
                             if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-                                // Convert to ArrayBuffer and send via WebSocket
                                 event.data.arrayBuffer().then(buffer => {
+                                    console.log('Sending audio buffer of size:', buffer.byteLength);
                                     ws.send(buffer);
+                                }).catch(err => {
+                                    console.error('Error processing audio chunk:', err);
                                 });
                             }
                         };
                         
-                        // Start the recorder with small time slices for near real-time processing
-                        recorder.start(1000); // Process in 1-second chunks
-                        console.log('Started Whisper audio streaming');
+                        // Start the recorder with smaller chunks for more frequent updates
+                        recorder.start(500); // Process in 500ms chunks
+                        console.log('Media recorder started');
+                        
+                        // Handle errors from the media recorder
+                        recorder.onerror = (event) => {
+                            console.error('MediaRecorder error:', event);
+                            setError('Error in audio recording');
+                        };
+                        
                     } catch (err) {
                         console.error('Error setting up audio streaming:', err);
-                        setError('Failed to access microphone for streaming');
+                        setError(`Failed to access microphone: ${err instanceof Error ? err.message : 'Unknown error'}`);
                     }
                 }
             };
@@ -432,25 +451,28 @@ export function useTranscriber(): Transcriber {
             // Handle messages from the WebSocket
             ws.onmessage = (event) => {
                 try {
+                    console.log('Raw WebSocket message received:', event.data);
                     const data = JSON.parse(event.data);
-                    console.log('WebSocket received:', {
-                        engine,
+                    
+                    // Log detailed information about the received data
+                    console.log('Parsed WebSocket data:', {
                         hasText: !!data.text,
                         hasSegments: !!data.segments,
-                        segmentsCount: data.segments?.length
+                        segmentsCount: data.segments?.length,
+                        dataType: data.type || 'unknown'
                     });
                     
                     // Handle error messages
                     if (data.error) {
-                        console.error('WebSocket error:', data.error);
-                        setError(data.error);
+                        const errorMsg = `WebSocket error: ${data.error}`;
+                        console.error(errorMsg);
+                        setError(errorMsg);
                         return;
                     }
                     
                     // Process transcription text
                     if (data.text) {
-                        console.log('Received transcription:', data.text);
-                        console.log('Received segments:', data.segments);
+                        console.log('Transcript text received:', data.text);
                         
                         // Process segments for display
                         const processedSegments = (data.segments || []).map((segment: any) => ({
@@ -459,6 +481,11 @@ export function useTranscriber(): Transcriber {
                             end: segment.end || segment.timestamp?.[1]
                         }));
                         
+                        if (processedSegments.length > 0) {
+                            console.log(`Processed ${processedSegments.length} segments`);
+                        }
+                        
+                        // Update local state
                         setTranscript(prev => ({
                             isBusy: true,
                             text: data.text,
@@ -471,7 +498,9 @@ export function useTranscriber(): Transcriber {
                         }
                     }
                 } catch (e) {
-                    console.error('Error parsing WebSocket message:', e);
+                    const errorMsg = `Error processing WebSocket message: ${e instanceof Error ? e.message : String(e)}`;
+                    console.error(errorMsg, e);
+                    setError(errorMsg);
                 }
             };
             
@@ -487,17 +516,40 @@ export function useTranscriber(): Transcriber {
             };
             
         } catch (error: any) {
-            console.error('Error in streaming setup:', error);
-            setError(`Failed to set up streaming: ${error.message}`);
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            const errorDetails = error.response ? 
+                `Status: ${error.response.status} - ${error.response.statusText}` : 
+                '';
+                
+            console.error('Error in streaming setup:', {
+                error: errorMessage,
+                details: errorDetails,
+                stack: error.stack
+            });
+            
+            setError(`Failed to set up streaming: ${errorMessage} ${errorDetails}`.trim());
+            
+            // Clean up resources
             cleanupAudioResources();
             
-            // Close the WebSocket connection on error
+            // Close the WebSocket connection if it exists
             if (webSocketRef.current) {
-                webSocketRef.current.close();
+                try {
+                    if (webSocketRef.current.readyState === WebSocket.OPEN) {
+                        webSocketRef.current.close(1000, 'Setup error');
+                    }
+                } catch (closeError) {
+                    console.error('Error closing WebSocket:', closeError);
+                }
                 webSocketRef.current = null;
             }
             
             setIsBusy(false);
+            
+            // Log the full error for debugging
+            if (process.env.NODE_ENV === 'development') {
+                console.error('Full error details:', error);
+            }
         }
     }, [model, language, engine]);
     

@@ -135,3 +135,158 @@ def transcribe_audio_chunk(audio_data: bytes, model_name: str = "base", language
         # Clean up the temporary file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
+# --- Whisper.cpp Integration for Live Transcription ---
+import subprocess
+import re
+
+# Paths retrieved from memory/setup script
+# Ensure these paths are correct for your environment.
+WHISPER_CPP_BASE_DIR = r"C:\Users\divya.eesarla\Desktop\Speech Local - Copy\whisper.cpp"
+# Path to the main whisper.cpp executable (CMake build path)
+WHISPER_CPP_MAIN_EXE = os.path.join(WHISPER_CPP_BASE_DIR, "build", "bin", "Release", "main.exe")
+# Path to the whisper.cpp model (ggml-base.en.bin)
+WHISPER_CPP_MODEL_PATH = os.path.join(WHISPER_CPP_BASE_DIR, "models", "ggml-base.en.bin")
+
+logger.info(f"Whisper.cpp main executable path: {WHISPER_CPP_MAIN_EXE}")
+logger.info(f"Whisper.cpp model path: {WHISPER_CPP_MODEL_PATH}")
+
+if not os.path.isfile(WHISPER_CPP_MAIN_EXE):
+    logger.error(f"FATAL: Whisper.cpp main.exe not found at {WHISPER_CPP_MAIN_EXE}. Please run setup_whisper_cpp.bat.")
+if not os.path.isfile(WHISPER_CPP_MODEL_PATH):
+    logger.error(f"FATAL: Whisper.cpp model not found at {WHISPER_CPP_MODEL_PATH}. Please ensure it was downloaded.")
+
+def parse_whisper_cpp_output(output: str) -> List[Dict[str, Any]]:
+    """
+    Parse the stdout of whisper.cpp (main.exe) to extract timestamped segments.
+    Expected format: [HH:MM:SS.mmm --> HH:MM:SS.mmm] Text segment
+    """
+    segments = []
+    # Regex to capture timestamps and text. Handles potential extra spaces.
+    pattern = re.compile(r"\[(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})\]\s*(.*)")
+    for line in output.strip().split('\n'):
+        match = pattern.match(line)
+        if match:
+            start_time, end_time, text = match.groups()
+            segments.append({
+                "start": start_time,
+                "end": end_time,
+                "text": text.strip()
+            })
+            logger.debug(f"Parsed segment: {{'start': '{start_time}', 'end': '{end_time}', 'text': '{text.strip()}'}}")
+        elif line.strip() and not line.startswith("whisper_init_from_file") and not line.startswith("log_mel_filter_bank") and not line.startswith("encode_segment") and not line.startswith("decode_segment") and not line.startswith("prompt") and not line.startswith("system_info"):
+            # Log non-empty lines that don't match the expected segment format and are not known info lines
+            logger.warning(f"Non-matching or info line from whisper.cpp stdout: {line}")
+    return segments
+
+def transcribe_audio_chunk_cpp(audio_data: bytes, language: str = "en") -> Dict[str, Any]:
+    """
+    Transcribe an audio chunk using whisper.cpp's main.exe.
+
+    Args:
+        audio_data: Audio data as bytes (expected to be WAV format compatible).
+        language: Language code for transcription (e.g., 'en', 'auto'). 
+                  Note: ggml-base.en.bin is English-only.
+
+    Returns:
+        Dictionary with 'text' (full transcript) and 'segments' (list of timestamped parts).
+    """
+    if not os.path.isfile(WHISPER_CPP_MAIN_EXE):
+        logger.error(f"Whisper.cpp main.exe not found at: {WHISPER_CPP_MAIN_EXE}")
+        raise FileNotFoundError(f"Whisper.cpp main.exe not found. Please ensure it's correctly set up.")
+    if not os.path.isfile(WHISPER_CPP_MODEL_PATH):
+        logger.error(f"Whisper.cpp model not found at: {WHISPER_CPP_MODEL_PATH}")
+        raise FileNotFoundError(f"Whisper.cpp model not found. Please ensure it's correctly set up.")
+
+    temp_file_path = ""
+    try:
+        # Create a temporary file for the audio data with .wav suffix
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+        
+        logger.info(f"Temporary audio file for whisper.cpp: {temp_file_path}")
+
+        # Prepare the command for whisper.cpp main.exe
+        cmd = [
+            WHISPER_CPP_MAIN_EXE,
+            "-m", WHISPER_CPP_MODEL_PATH,
+            "-f", temp_file_path,
+            "-l", language, # Model ggml-base.en.bin is English-only
+            # "-t", "4",  # Example: Number of threads, adjust based on your CPU
+            "--no-timestamps", "false", # Explicitly ask for timestamps (default behavior)
+            # "--output-txt" # If specified without a file, prints to stdout.
+                           # Default behavior is to print timestamped lines to stdout.
+        ]
+        
+        logger.info(f"Executing whisper.cpp command: {' '.join(cmd)}")
+        
+        # subprocess.CREATE_NO_WINDOW is Windows-specific to hide the console window.
+        creation_flags = 0
+        if os.name == 'nt':
+            creation_flags = subprocess.CREATE_NO_WINDOW
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            creationflags=creation_flags
+        )
+        
+        # Timeout for the process to complete (e.g., 30 seconds for a chunk)
+        stdout, stderr = process.communicate(timeout=30) 
+
+        if process.returncode != 0:
+            logger.error(f"whisper.cpp failed with exit code {process.returncode}")
+            logger.error(f"whisper.cpp stderr: {stderr.strip()}")
+            raise Exception(f"whisper.cpp transcription failed. Error: {stderr.strip()}")
+            
+        logger.info(f"whisper.cpp stdout raw: \n{stdout}")
+        if stderr.strip(): # whisper.cpp often prints progress/model info to stderr
+             logger.info(f"whisper.cpp stderr (info/progress): \n{stderr.strip()}")
+
+        segments = parse_whisper_cpp_output(stdout)
+        
+        if not segments and stdout.strip(): # If parsing failed but there was output
+            logger.warning("No segments parsed, but stdout was not empty. Raw output used as fallback.")
+            # Fallback for non-timestamped or differently formatted output if parsing fails
+            full_text = stdout.strip()
+        else:
+            full_text = " ".join([seg["text"] for seg in segments]).strip()
+
+        return {
+            "text": full_text,
+            "segments": segments
+        }
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"whisper.cpp command timed out after 30s for file: {temp_file_path}")
+        if process:
+            process.kill()
+            # Try to get any remaining output
+            try:
+                stdout, stderr = process.communicate(timeout=1)
+                logger.error(f"Timeout stdout: {stdout.strip() if stdout else ''}")
+                logger.error(f"Timeout stderr: {stderr.strip() if stderr else ''}")
+            except Exception as e_comm:
+                logger.error(f"Error getting output after timeout kill: {e_comm}")
+        raise Exception("whisper.cpp transcription timed out.")
+    except FileNotFoundError as fnf_error:
+        logger.error(f"File not found error during whisper.cpp transcription: {str(fnf_error)}")
+        raise # Re-raise specific FileNotFoundError
+    except Exception as e:
+        logger.error(f"Generic error during whisper.cpp transcription for file {temp_file_path}: {str(e)}")
+        # Log traceback for unexpected errors
+        import traceback
+        logger.error(traceback.format_exc())
+        raise Exception(f"An unexpected error occurred during whisper.cpp transcription: {str(e)}")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                logger.info(f"Successfully deleted temp file: {temp_file_path}")
+            except Exception as e_del:
+                logger.error(f"Error deleting temp file {temp_file_path}: {str(e_del)}")
+

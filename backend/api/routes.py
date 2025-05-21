@@ -10,7 +10,7 @@ import shutil
 from typing import Optional, Union, List
 from api.ollama_handler import generate_response
 from api.faster_transcription import FasterTranscriber, get_transcriber
-from api.whisper_handler import get_whisper_transcriber, transcribe_audio_chunk
+from api.whisper_handler import get_whisper_transcriber, transcribe_audio_chunk, transcribe_audio_chunk_cpp
 
 app = FastAPI()
 
@@ -231,6 +231,36 @@ async def stop_transcription():
     except Exception as e:
         logger.error(f"Error stopping transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/transcribe-live-chunk")
+async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):
+    """
+    Receive an audio chunk (expected WAV format), transcribe it using whisper.cpp,
+    and return timestamped segments.
+    """
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="No audio data received.")
+
+        logger.info(f"Received live audio chunk for whisper.cpp, size: {len(audio_bytes)} bytes")
+        
+        # Using the new whisper.cpp based transcriber
+        # The ggml-base.en.bin model is English-only, so language='en' is appropriate.
+        result = transcribe_audio_chunk_cpp(audio_data=audio_bytes, language="en")
+        
+        logger.info(f"whisper.cpp live chunk transcription result: {result}")
+        return result
+
+    except FileNotFoundError as e_fnf:
+        logger.error(f"transcribe_live_audio_chunk_endpoint: Whisper.cpp file not found - {str(e_fnf)}")
+        raise HTTPException(status_code=500, detail=f"Live transcription engine misconfiguration: {str(e_fnf)}")
+    except Exception as e:
+        logger.error(f"Error processing live audio chunk with whisper.cpp: {str(e)}")
+        # Consider logging traceback for detailed debugging
+        # import traceback
+        # logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error transcribing live audio chunk: {str(e)}")
 
 @app.websocket("/transcriber/ws")
 async def websocket_endpoint(websocket: WebSocket):
