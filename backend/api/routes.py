@@ -7,10 +7,9 @@ import json
 import os
 import tempfile
 import shutil
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict, Any
 from api.ollama_handler import generate_response
 from api.faster_transcription import FasterTranscriber, get_transcriber
-from api.whisper_handler import get_whisper_transcriber, transcribe_audio_chunk, transcribe_audio_chunk_cpp
 
 app = FastAPI()
 
@@ -41,6 +40,9 @@ async def rate_limiter(request: Request):
 class SummaryRequest(BaseModel):
     transcript: str
 
+class ActionItemsRequest(BaseModel):
+    transcript: str
+
 import logging
 
 # Configure logging
@@ -58,14 +60,19 @@ async def generate_summary(request: SummaryRequest, req: Request, limiter: None 
     """
     try:
         system_prompt = (
-            "You are a professional meeting minutes writer. Create a concise and structured Minutes of Meeting (MOM) with these sections:\n\n"
+            "You are a professional meeting minutes writer.\n"
+            "Your task is to generate a concise, well-structured summary of a meeting using only the information from the transcript provided.\n\n"
+            "Please format the summary with these sections:\n"
             "1. Meeting Overview\n"
             "2. Key Discussion Points\n"
             "3. Action Items\n\n"
-            "IMPORTANT: Base your summary ONLY on the actual transcript provided below. Do NOT use generic content, placeholder names, or made-up information. If the transcript is unclear or too short, state that in your summary.\n\n"
-            "Format your response in rich HTML format with proper headings (h2, h3), paragraphs, and formatting. Use <b> for important points, <ul> and <li> for lists where appropriate.\n\n"
-            "Here's the transcript:\n"
+            "Guidelines:\n"
+            "- Do NOT invent or assume any information not present in the transcript.\n"
+            "- Be brief and to the point. Avoid repetition.\n"
+
+            "Transcript:\n"
         )
+
         
         # Log the transcript length for debugging
         transcript_length = len(request.transcript)
@@ -83,68 +90,177 @@ async def generate_summary(request: SummaryRequest, req: Request, limiter: None 
         logger.error(f"Error generating summary: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/extract-action-items")
-async def extract_action_items(request: SummaryRequest, req: Request, limiter: None = Depends(rate_limiter)):
+@app.post("/generate-action-items")
+async def extract_action_items(request: Union[ActionItemsRequest, dict], req: Request, limiter: None = Depends(rate_limiter)):
     """
     Extract action items from the meeting transcript.
+    
+    Expected request format:
+    {
+        "transcript": "[meeting transcript text]"
+    }
     """
     try:
+        # Log the incoming request for debugging
+        logger.info(f"Received extract_action_items request")
+        
+        # Handle both Pydantic model and dict formats
+        if isinstance(request, dict):
+            if 'transcript' not in request:
+                logger.error(f"Invalid request format: {request}")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid request format. Expected {'transcript': 'your_transcript_text_here'}"
+                )
+            transcript = request.get('transcript', '').strip()
+        else:
+            transcript = request.transcript.strip()
+        
+        # Validate transcript content
+        if not transcript:
+            logger.error("Empty transcript provided")
+            return {
+                "status": "error", 
+                "detail": "Empty transcript provided"
+            }
+            
         system_prompt = (
             "Extract action items from the following meeting transcript. For each action item, identify:\n"
             "1. The specific task to be done\n"
             "2. The person or team assigned to it\n\n"
-            "IMPORTANT: Base your extraction ONLY on the actual transcript provided below. Do NOT use generic content, placeholder names, or made-up information. If no clear action items or assignees are found, state that explicitly.\n\n"
-            "Format your response as an HTML list with each action item formatted like this:\n"
-            "<div class=\"action-item\">\n"
-            "  <p class=\"task\"><b>Task:</b> [task description]</p>\n"
-            "  <p class=\"assignee\"><b>Assignee:</b> [person/team]</p>\n"
-            "</div>\n\n"
-            "Here's the transcript:\n"
+            "Format the response as a clear list of action items. If no clear action items can be identified, \n"
+            "state that no specific action items were found.\n\n"
+            "Transcript:\n"
         )
         
         # Log the transcript length for debugging
-        transcript_length = len(request.transcript)
-        logger.warning(f"Received transcript for action items with length: {transcript_length}")
+        transcript_length = len(transcript)
+        logger.info(f"Processing transcript with length: {transcript_length} characters")
         
-        # Add a check for minimum transcript length
-        if transcript_length < 20:  # Arbitrary minimum length
-            logger.warning(f"Transcript too short: {request.transcript}")
-            return {"status": "error", "detail": "Transcript too short to extract meaningful action items"}
+        # Check for minimum transcript length
+        if transcript_length < 10:  # Arbitrary minimum length
+            logger.warning("Transcript too short for action item extraction")
+            return {
+                "status": "completed", 
+                "action_items": "Transcript too short to extract meaningful action items"
+            }
             
-        # Directly call Ollama API and get the response
-        response = generate_response(prompt=request.transcript, system_message=system_prompt, max_tokens=1000)
-        return {"status": "completed", "action_items": response}
+        try:
+            # Call Ollama API and get the response
+            logger.info("Sending request to Ollama API for action item extraction")
+            response = generate_response(
+                prompt=transcript, 
+                system_message=system_prompt, 
+                max_tokens=1000
+            )
+            
+            # Log successful response
+            logger.info("Successfully extracted action items")
+            return {
+                "status": "completed", 
+                "action_items": response
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calling Ollama API: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error processing action items: {str(e)}"
+            )
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+        
     except Exception as e:
-        logger.error(f"Error extracting action items: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error in extract_action_items: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail="An unexpected error occurred while processing your request"
+        )
 
 
 # File upload and transcription endpoints
 
 @app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...), engine: str = Form("faster_whisper")):
+    temp_dir = None
+    temp_file_path = None
+    
     try:
         start_time = time()
+        logger.info(f"Starting transcription for file: {file.filename}, content_type: {file.content_type}")
+        
+        # Create a temporary directory for the file
         temp_dir = tempfile.mkdtemp()
-        temp_file_path = os.path.join(temp_dir, file.filename)
+        temp_file_path = os.path.join(temp_dir, file.filename or "audio.wav")
+        
+        logger.info(f"Saving uploaded file to temporary location: {temp_file_path}")
         
         # Save uploaded file to temp location
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Use faster-whisper (server-based) transcription
-        transcriber = FasterTranscriber()
+        # Verify the file exists and has content
+        if not os.path.exists(temp_file_path):
+            raise Exception(f"Failed to save file to {temp_file_path}")
+            
+        file_size = os.path.getsize(temp_file_path)
+        logger.info(f"File saved successfully. Size: {file_size} bytes")
+        
+        if file_size == 0:
+            raise Exception("Uploaded file is empty")
+        
+        # Initialize the transcriber with explicit parameters
+        logger.info("Initializing FasterTranscriber...")
+        transcriber = FasterTranscriber(
+            model_name="base",
+            language="en",
+            device_type="cpu"
+        )
+        
+        logger.info("Starting transcription...")
         result = await transcriber.transcribe_file(temp_file_path)
         
-        # Clean up temporary files
-        shutil.rmtree(temp_dir)
-        
-        logger.info(f"Transcription completed. Transcript length: {len(result)}")
-        return {"status": "completed", "transcript": result}
+        # Log result format and content
+        if isinstance(result, dict):
+            text_length = len(result.get('text', ''))
+            segments_count = len(result.get('segments', []))
+            logger.info(f"Transcription completed. Transcript length: {text_length}, Segments: {segments_count}")
+            
+            # Return both text and segments for the frontend
+            return {
+                "status": "completed", 
+                "transcript": result.get('text', ''),
+                "segments": result.get('segments', [])
+            }
+        else:
+            # Handle legacy format (string only)
+            logger.info(f"Transcription completed with legacy format. Transcript length: {len(result) if result else 0}")
+            return {"status": "completed", "transcript": result}
             
     except Exception as e:
-        logger.error(f"Error transcribing file: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error transcribing file: {str(e)}", exc_info=True)
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error transcribing file: {str(e)}"
+        )
+        
+    finally:
+        # Clean up temporary files
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.error(f"Error deleting temp file {temp_file_path}: {e}")
+                
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                os.rmdir(temp_dir)
+            except Exception as e:
+                logger.error(f"Error deleting temp directory {temp_dir}: {e}")
 
 @app.get("/engines")
 async def list_engines():
@@ -235,7 +351,7 @@ async def stop_transcription():
 @app.post("/api/transcribe-live-chunk")
 async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):
     """
-    Receive an audio chunk (expected WAV format), transcribe it using whisper.cpp,
+    Receive an audio chunk (expected WAV format), transcribe it using faster-whisper,
     and return timestamped segments.
     """
     try:
@@ -243,23 +359,54 @@ async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="No audio data received.")
 
-        logger.info(f"Received live audio chunk for whisper.cpp, size: {len(audio_bytes)} bytes")
+        logger.info(f"Received live audio chunk, size: {len(audio_bytes)} bytes")
         
-        # Using the new whisper.cpp based transcriber
-        # The ggml-base.en.bin model is English-only, so language='en' is appropriate.
-        result = transcribe_audio_chunk_cpp(audio_data=audio_bytes, language="en")
+        # Create a temporary file to store the audio chunk
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_file_path = temp_file.name
         
-        logger.info(f"whisper.cpp live chunk transcription result: {result}")
-        return result
+        try:
+            # Get the faster-whisper transcriber
+            transcriber = get_transcriber()
+            
+            # Transcribe the audio chunk
+            segments, info = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: transcriber.model.transcribe(
+                    temp_file_path,
+                    language="en",
+                    beam_size=5,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500)
+                )
+            )
+            
+            # Convert segments to the expected format
+            result = {
+                "text": " ".join(segment.text for segment in segments),
+                "segments": [
+                    {
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text
+                    }
+                    for segment in segments
+                ]
+            }
+            
+            logger.info(f"Live chunk transcription completed. Text length: {len(result['text'])}")
+            return result
+            
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.error(f"Error cleaning up temp file {temp_file_path}: {e}")
 
-    except FileNotFoundError as e_fnf:
-        logger.error(f"transcribe_live_audio_chunk_endpoint: Whisper.cpp file not found - {str(e_fnf)}")
-        raise HTTPException(status_code=500, detail=f"Live transcription engine misconfiguration: {str(e_fnf)}")
     except Exception as e:
-        logger.error(f"Error processing live audio chunk with whisper.cpp: {str(e)}")
-        # Consider logging traceback for detailed debugging
-        # import traceback
-        # logger.error(traceback.format_exc())
+        logger.error(f"Error processing live audio chunk: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error transcribing live audio chunk: {str(e)}")
 
 @app.websocket("/transcriber/ws")

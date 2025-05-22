@@ -76,17 +76,20 @@ function App() {
   const [summary, setSummary] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isGeneratingActions, setIsGeneratingActions] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [error, setError] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isScreenRecording, setIsScreenRecording] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
   const [liveSegments, setLiveSegments] = useState<Array<{text: string, start?: number, end?: number}>>([]);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const screenMediaRecorderRef = useRef<MediaRecorder | null>(null);
   const screenAudioChunksRef = useRef<Blob[]>([]);
   const [isCppLiveActive, setIsCppLiveActive] = useState(false); // For whisper.cpp live transcription mode
+  const [uploadedAudioFile, setUploadedAudioFile] = useState<File | null>(null);
   const totalLiveStreamDurationRef = useRef<number>(0); // Tracks cumulative duration for live transcript timestamps
   const audioContextRef = useRef<AudioContext | null>(null);
   const webSocketRef = useRef<WebSocket | null>(null);
@@ -133,14 +136,14 @@ function App() {
   };
 
   const handleGenerateSummary = async () => {
-    if (transcriber.output && transcriber.output.text) {
+    if (liveTranscript && liveTranscript.trim() !== '') {
       try {
         console.log('Starting summary generation...');
         setError('');
         setIsProcessing(true);
         
-        console.log('Transcript length:', transcriber.output.text.length);
-        const summaryText = await generateSummaryFromAPI(transcriber.output.text);
+        console.log('Transcript length for summary:', liveTranscript.length);
+        const summaryText = await generateSummaryFromAPI(liveTranscript);
         
         console.log('Summary received, length:', summaryText.length);
         setSummary(summaryText);
@@ -155,7 +158,8 @@ function App() {
         console.log('Summary generation process finished');
       }
     } else {
-      console.warn('No transcript available for summary generation');
+      console.warn('No transcript available for summary generation (liveTranscript is empty).');
+      setError('No transcript available for summary generation.');
     }
   };
 
@@ -166,7 +170,7 @@ function App() {
     
     try {
       // Make a request to the new API endpoint for extracting action items
-      const response = await fetch(`${API_URL}/extract-action-items`, {
+      const response = await fetch(`${API_URL}/generate-action-items`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -226,8 +230,9 @@ function App() {
   };
 
   const handleGenerateActionItems = async () => {
-    if (!transcriber.output?.text) {
+    if (!liveTranscript || liveTranscript.trim() === '') {
       setError('No transcript available to generate action items');
+      console.warn('Attempted to generate action items with no liveTranscript.');
       return;
     }
     
@@ -235,17 +240,30 @@ function App() {
     setError('');
     
     try {
-      const response = await axios.post<ActionItemType[] | string>(`${API_URL}/generate-action-items`, {
-        text: transcriber.output.text
+      console.log('Generating action items from transcript length:', liveTranscript.length);
+      const response = await axios.post<{ status: string; action_items?: ActionItemType[] | string; detail?: string }>(`${API_URL}/generate-action-items`, {
+        transcript: liveTranscript
       });
+      console.log('Action Items API Response:', JSON.stringify(response.data));
       
-      // Check if the response is an array of action items or HTML
-      if (Array.isArray(response.data)) {
-        setActionItems(response.data);
-      } else if (typeof response.data === 'string') {
-        setActionItems(response.data);
+      if (response.data && response.data.status === 'completed' && 'action_items' in response.data) {
+        const actionItemsData = response.data.action_items;
+        if (Array.isArray(actionItemsData)) {
+          setActionItems(actionItemsData);
+        } else if (typeof actionItemsData === 'string') {
+          setActionItems(actionItemsData);
+        } else {
+          // This case means action_items exists but is neither array nor string
+          setError('Action items data received, but not in expected format (array or string).');
+          setActionItems(null); // Clear previous items
+        }
+      } else if (response.data && response.data.status === 'error' && response.data.detail) {
+        setError(response.data.detail);
+        setActionItems(null); // Clear previous items
       } else {
-        setError('Unexpected response format from server');
+        // This covers cases where response.data is not as expected (e.g. missing status, or unexpected structure)
+        setError('Unexpected response format from server.');
+        setActionItems(null); // Clear previous items
       }
     } catch (error) {
       console.error('Error generating action items:', error);
@@ -289,7 +307,7 @@ function App() {
   
   const audioPlayerRef = useRef<HTMLAudioElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+
 
   // Helper function to convert HH:MM:SS.mmm to seconds
   const timeStringToSeconds = (timeStr: string): number => {
@@ -418,45 +436,58 @@ function App() {
     });
   };
 
-  const handleGenerateTranscript = async () => {
-    if (!recordedBlob) {
-      console.error('No recorded audio available for transcription.');
-      setError('No recorded audio available. Please record audio first.');
+  const handleGenerateTranscript = async (uploadedFile?: File) => {
+    const audioToTranscribe = uploadedFile || recordedBlob;
+
+    if (!audioToTranscribe) {
+      console.error('No audio available for transcription.');
+      setError('No audio available. Please record or upload audio first.');
       return;
     }
 
-    setIsProcessing(true);
+    if (audioToTranscribe instanceof Blob) {
+      setAudioUrl(URL.createObjectURL(audioToTranscribe));
+    }
+
+    setIsTranscribing(true);
     setError('');
 
     try {
-      console.log('Starting transcription of recorded audio...');
+      console.log('Starting transcription...');
+      const audioFile = audioToTranscribe instanceof File ? audioToTranscribe : new File([audioToTranscribe], 'recording.webm', { type: audioToTranscribe.type });
       
-      // Create a file from the recorded blob
-      const audioFile = new File([recordedBlob], 'recording.webm', { type: recordedBlob.type });
+      const formDataObj = new FormData(); 
+      formDataObj.append('file', audioFile);
+      formDataObj.append('engine', 'faster_whisper');
       
-      // Call the transcriber's transcribeFile method
-      if (transcriber && typeof transcriber.transcribeFile === 'function') {
-        const result = await transcriber.transcribeFile(audioFile);
-        
-        if (result.error) {
-          throw new Error(result.error);
-        }
-        
-        console.log('Transcription successful:', result);
-        
-        // Update the UI with the transcription result
-        if (result.transcript) {
-          setLiveTranscript(result.transcript);
-          setCurrentStep(3); // Move to the next step in the UI
-        }
+      const response = await fetch(`${API_URL}/transcribe`, {
+        method: 'POST',
+        body: formDataObj
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Transcription failed: ${response.status} - ${errorText}`);
+      }
+      
+      const result = await response.json();
+      console.log('Transcription API response:', result);
+      
+      if (result.status === 'completed') {
+        setLiveSegments(result.segments || []);
+        setLiveTranscript(result.transcript || '');
+        setCurrentStep(3);
+      } else if (result.status === 'error') {
+        throw new Error(result.detail || 'Transcription API returned an error.');
       } else {
-        throw new Error('Transcriber not properly initialized');
+        throw new Error('Unexpected response format from transcription API.');
       }
     } catch (err) {
       console.error('Error generating transcript:', err);
       setError(`Failed to generate transcript: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
-      setIsProcessing(false);
+      setIsTranscribing(false);
+      // setIsProcessing(false);
     }
   };
 
@@ -806,7 +837,10 @@ function App() {
                     onChange={(e) => {
                       const file = e.target.files?.[0];
                       if (file) {
-                        transcriber.transcribeFile(file);
+                        setUploadedAudioFile(file);
+                        setAudioUrl(URL.createObjectURL(file));
+                        setRecordedBlob(null); // Clear any previous recording
+                        setCurrentStep(2); // Show Generate Transcript button
                       }
                     }}
                   />
@@ -877,27 +911,7 @@ function App() {
               </div>
             )}
             
-            {/* Audio player for recorded audio */}
-            {audioUrl && (
-          <div className="mt-4 flex justify-center">
-            <button
-              onClick={handleGenerateTranscript}
-              className="bg-[#5236ab] hover:bg-[#4527a0] text-white font-medium py-2 px-6 rounded-lg shadow-md transition-colors duration-200 flex items-center"
-              disabled={isProcessing} // Disable button when processing
-            >
-              {Icon('FileText', 20, "w-5 h-5 mr-2")} 
-              {isProcessing ? 'Generating Transcript...' : 'Generate Transcript'}
-            </button>
-          </div>
-        )}
-
-        {/* Original audio player part - assuming it was after the part to be replaced or this is a new addition point*/}
-        {audioUrl && (
-              <div className="mt-4 p-4 bg-gray-50 rounded-lg">
-                <p className="font-medium text-gray-700 mb-2">Recorded Audio:</p>
-                <audio ref={audioPlayerRef} controls className="w-full" src={audioUrl}></audio>
-              </div>
-            )}
+            {/* The audio player and generate transcript button will be handled by the Card component below */}
           </div>
         </Card>
 
@@ -951,17 +965,45 @@ function App() {
           </pre>
         </div>
         
+        {/* Display audio player when audio is available */}
+        {audioUrl && (
+          <Card title="Recorded Audio" icon={Icon('Music')} fullWidth className="mb-4">
+            <div className="p-4">
+              <audio 
+                className="w-full" 
+                controls 
+                src={audioUrl}
+              >
+                Your browser does not support the audio element.
+              </audio>
+              {/* Generate Transcript Button - Placed below the audio player */}
+              {currentStep === 2 && !isLiveMode && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    onClick={() => handleGenerateTranscript(uploadedAudioFile || undefined)}
+                    className="bg-[#5236ab] hover:bg-[#4527a0] text-white font-medium py-2 px-6 rounded-lg shadow-md transition-colors duration-200 flex items-center"
+                    disabled={isTranscribing || isProcessing}
+                  >
+                    {Icon('FileText', 20, "w-5 h-5 mr-2")}
+                    {isTranscribing ? 'Generating Transcript...' : 'Generate Transcript'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </Card>
+        )}
+        
         {/* Always display the transcript card, even if empty */}
-        <Card title="Transcript" icon={Icon('FileText')} fullWidth>
-          {transcriber.output ? (
+        <Card title="Transcript" icon={Icon('FileText')} fullWidth className="mb-4">
+          {(liveTranscript && liveTranscript.trim() !== '') || (liveSegments && liveSegments.length > 0) ? (
             <>
-              <Transcript transcribedData={transcriber.output} />
+              <Transcript transcriptText={liveTranscript} segments={liveSegments} />
               <div className="mt-4 flex justify-end space-x-4">
                 <button
                   onClick={handleGenerateSummary}
-                  disabled={isProcessing}
+                  disabled={isProcessing || isTranscribing} // Also disable if still transcribing
                   className={`flex items-center px-4 py-2 ${
-                    isProcessing ? 'bg-gray-400' : 'bg-[#5236ab] hover:bg-[#4527a0]'
+                    (isProcessing || isTranscribing) ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#5236ab] hover:bg-[#4527a0]'
                   } text-white rounded-md transition-colors`}
                 >
                   {Icon('ChevronRight', 16, "w-4 h-4 mr-2")}
@@ -978,11 +1020,34 @@ function App() {
 
         {/* Summary Display */}
         {summary && (
-          <Card title="Meeting Summary" icon={Icon('FileText')} fullWidth>
+          <Card title="Meeting Summary" icon={Icon('FileText')} fullWidth className="mb-4">
             <div className="bg-gray-50 p-4 rounded-lg mb-4">
               <div className="prose max-w-none">
-                {/* Use dangerouslySetInnerHTML to render HTML content safely */}
-                <div dangerouslySetInnerHTML={{ __html: summary }}></div>
+                {/* Format the summary with React Markdown */}
+                <ReactMarkdown
+                  components={{
+                    // Make headings bold and properly styled
+                    h1: ({ node, ...props }) => <h1 className="text-xl font-bold mt-4 mb-2" {...props} />,
+                    h2: ({ node, ...props }) => <h2 className="text-lg font-bold mt-3 mb-2" {...props} />,
+                    h3: ({ node, ...props }) => <h3 className="text-md font-bold mt-2 mb-1" {...props} />,
+                    // Style list items
+                    li: ({ node, ...props }) => <li className="ml-4 my-1" {...props} />,
+                    // Style paragraphs
+                    p: ({ node, ...props }) => <p className="my-2" {...props} />,
+                    // Style section headers (detected by regex)
+                    strong: ({ node, ...props }) => {
+                      // Check if the content looks like a section header
+                      const isSectionHeader = props.children && typeof props.children === 'string' &&
+                        /^(\d+\.|Meeting Overview|Key Discussion Points|Action Items)/.test(props.children as string);
+                      
+                      return isSectionHeader ?
+                        <strong className="text-lg font-bold block mt-4 mb-2 text-[#5236ab]" {...props} /> :
+                        <strong className="font-bold" {...props} />;
+                    },
+                  }}
+                >
+                  {formatMarkdown(summary)}
+                </ReactMarkdown>
               </div>
             </div>
             <div className="flex justify-between">
@@ -1009,12 +1074,21 @@ function App() {
 
         {/* Action Items Display - Either from parsed actionItems array or raw HTML */}
         {actionItems && (
-          <Card title="Action Items" icon={Icon('CheckSquare')} fullWidth>
+          <Card title="Action Items" icon={Icon('CheckSquare')} fullWidth className="mb-4">
             <div className="space-y-4">
               {typeof actionItems === 'string' ? (
-                // Display HTML action items
+                // Display HTML action items or show a message when no items are found
                 <div className="bg-gray-50 p-4 rounded-lg">
-                  <div dangerouslySetInnerHTML={{ __html: actionItems }}></div>
+                  {actionItems.includes('no specific action items') || actionItems.trim() === '' ? (
+                    <div className="text-center py-4">
+                      <div className="text-gray-500 flex items-center justify-center mb-2">
+                        {Icon('Info', 24, "text-gray-400 mr-2")}
+                      </div>
+                      <p className="text-gray-600 font-medium">No action items found in this transcript.</p>
+                    </div>
+                  ) : (
+                    <div dangerouslySetInnerHTML={{ __html: actionItems }}></div>
+                  )}
                 </div>
               ) : (
                 // Display traditional action items array
@@ -1046,6 +1120,8 @@ function App() {
           </Card>
         )}
 
+        
+
         {/* Error Display */}
         {error && (
           <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mt-4">
@@ -1071,14 +1147,15 @@ function App() {
         )}
 
         {/* Processing Indicator */}
-        {(transcriber.isBusy || isProcessing || isGeneratingActions) && (
+        {(transcriber.isBusy || isProcessing || isGeneratingActions || isTranscribing) && (
           <div className="fixed bottom-4 right-4 bg-white rounded-lg shadow-lg p-4 z-40 flex items-center">
             <div className="mr-3 w-6 h-6 border-t-2 border-[#5236ab] border-solid rounded-full animate-spin" />
             <div>
               <p className="font-medium text-gray-800 text-sm">
-                {isProcessing ? 'Generating Summary' : 
-                 isGeneratingActions ? 'Extracting Action Items' : 
-                 'Processing Audio'}
+                {isTranscribing ? 'Generating Transcript...' :
+                 isProcessing ? 'Generating Summary...' : 
+                 isGeneratingActions ? 'Extracting Action Items...' : 
+                 'Processing Audio...'}
               </p>
               <p className="text-xs text-gray-500">Processing in background...</p>
             </div>

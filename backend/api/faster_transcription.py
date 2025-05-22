@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import pyaudio
 import signal
+import asyncio
 import re
 import tempfile
 import wave
@@ -369,7 +370,25 @@ class FasterTranscriber:
         
         logger.info("Queues cleared")
         
-    def transcribe_file(self, file_path: str) -> str:
+    def _transcribe_internal(self, file_path):
+        try:
+            logger.info("Starting transcription with faster-whisper...")
+            segments, info = self.model.transcribe(
+                file_path,
+                language=self.language or "en",
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
+            # Convert generator to list to avoid generator issues across threads
+            segments_list = list(segments)
+            logger.info(f"Transcription completed. Segments: {len(segments_list)}")
+            return segments_list, info
+        except Exception as e:
+            logger.error(f"Error in _transcribe_internal: {str(e)}", exc_info=True)
+            raise
+            
+    async def transcribe_file(self, file_path: str):
         """
         Transcribe an audio or video file using the loaded model.
         
@@ -377,31 +396,59 @@ class FasterTranscriber:
             file_path: Path to the audio or video file to transcribe
             
         Returns:
-            Transcribed text as a string
+            A dictionary containing both the full transcript and timestamped segments
+            
+        Raises:
+            Exception: If there's an error during transcription
         """
-        logger.info(f"Transcribing file: {file_path}")
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
+        file_size = os.path.getsize(file_path)
+        logger.info(f"File size: {file_size} bytes")
+        
+        if file_size == 0:
+            raise ValueError("Cannot transcribe an empty file")
         
         try:
             # Use the loaded model to transcribe the file
-            segments, info = self.model.transcribe(
-                file_path,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
+            # Run the synchronous transcribe method in a thread pool
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            # Run the blocking transcribe call in a thread pool
+            logger.info("Running transcription in thread pool...")
+            segments, info = await loop.run_in_executor(None, lambda: self._transcribe_internal(file_path))
+            
+            if not segments:
+                logger.warning("No transcription segments were returned")
+                return {
+                    "text": "",
+                    "segments": []
+                }
+            
+            # Format segments for frontend
+            formatted_segments = []
+            for segment in segments:
+                formatted_segments.append({
+                    "text": segment.text,
+                    "start": segment.start,
+                    "end": segment.end
+                })
             
             # Assemble the complete transcript
-            transcript = ""
-            for segment in segments:
-                transcript += segment.text + " "
-                
-            logger.info(f"Transcription completed. Length: {len(transcript)} characters")
-            return transcript.strip()
+            transcript = " ".join(segment.text for segment in segments)
+            logger.info(f"Transcription completed. Text length: {len(transcript)} characters")
+            
+            return {
+                "text": transcript.strip(),
+                "segments": formatted_segments
+            }
             
         except Exception as e:
-            logger.error(f"Error transcribing file {file_path}: {str(e)}")
-            raise
+            logger.error(f"Error transcribing file {file_path}: {str(e)}", exc_info=True)
+            raise Exception(f"Failed to transcribe file: {str(e)}") from e
 
 # Singleton instance for application-wide use
 _transcriber_instance = None
@@ -415,26 +462,44 @@ def get_transcriber(config=None):
         
     Returns:
         The global FasterTranscriber instance
+        
+    Raises:
+        Exception: If there's an error initializing the transcriber
     """
     global _transcriber_instance
     
-    if _transcriber_instance is None and config is not None:
-        # Create a copy of the config to avoid modifying the original dict in routes.py
-        config_for_faster_transcriber = config.copy()
-        # Remove 'engine' if present, as FasterTranscriber.__init__ doesn't expect it
-        config_for_faster_transcriber.pop('engine', None)
+    if _transcriber_instance is not None:
+        return _transcriber_instance
         
-        # Remove device-specific keys as FasterTranscriber.__init__ no longer uses them
-        config_for_faster_transcriber.pop('device', None)
-        config_for_faster_transcriber.pop('device_index', None)
-        config_for_faster_transcriber.pop('input_device', None)
-        config_for_faster_transcriber.pop('output_device', None)
-        config_for_faster_transcriber.pop('use_system_audio', None)
-        config_for_faster_transcriber.pop('capture_both_io', None)
-        
-        # Log the incoming configuration
-        logger.info(f"Creating transcriber with simplified config: {config_for_faster_transcriber}")
+    try:
+        if config is None:
+            config = {}
             
-        _transcriber_instance = FasterTranscriber(**config_for_faster_transcriber)
-    
-    return _transcriber_instance
+        # Set default values if not provided in config
+        model_name = config.get('model_name', 'base')
+        language = config.get('language', 'en')
+        device_type = config.get('device_type', 'cpu')
+        compute_type = config.get('compute_type', 'int8')
+        
+        logger.info(f"Initializing FasterTranscriber with model: {model_name}, device: {device_type}")
+        
+        _transcriber_instance = FasterTranscriber(
+            model_name=model_name,
+            language=language,
+            device_type=device_type,
+            compute_type=compute_type
+        )
+        
+        # Verify the model was initialized successfully
+        logger.info("Verifying transcriber initialization...")
+        if _transcriber_instance.model is not None:
+            logger.info(f"Transcriber initialized successfully with model: {model_name}")
+        else:
+            raise Exception("Model initialization failed, model is None")
+        
+        return _transcriber_instance
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize FasterTranscriber: {str(e)}", exc_info=True)
+        _transcriber_instance = None  # Reset instance to allow retry
+        raise Exception(f"Failed to initialize transcriber: {str(e)}") from e

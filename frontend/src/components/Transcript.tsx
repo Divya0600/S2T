@@ -1,13 +1,16 @@
 import { useRef, useEffect } from "react";
 
-import { TranscriberData } from "../hooks/useTranscriber";
+import { TranscriberData, TranscriptionSegment } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
 
 interface Props {
-    transcribedData: TranscriberData | undefined;
+    transcriptText: string | undefined;
+    segments: TranscriptionSegment[] | undefined;
+    // Keeping transcribedData for potential future use with live updates from useTranscriber, but prioritizing direct props for now
+    transcribedData?: TranscriberData | undefined; 
 }
 
-export default function Transcript({ transcribedData }: Props) {
+export default function Transcript({ transcriptText, segments, transcribedData }: Props) {
     const divRef = useRef<HTMLDivElement>(null);
 
     const saveBlob = (blob: Blob, filename: string) => {
@@ -19,17 +22,22 @@ export default function Transcript({ transcribedData }: Props) {
         URL.revokeObjectURL(url);
     };
     const exportTXT = () => {
-        let chunks = transcribedData?.chunks ?? [];
-        let text = chunks
-            .map((chunk) => chunk.text)
-            .join("")
+        // Prioritize direct segments if available, otherwise fall back to transcribedData.chunks for TXT export
+        let exportText = transcriptText || (transcribedData?.chunks?.map(chunk => chunk.text).join('') || '');
+        const exportSegments = segments || transcribedData?.chunks?.map(chunk => ({ 
+          text: chunk.text, 
+          start: chunk.timestamp?.[0],
+          end: chunk.timestamp?.[1]
+        })) || [];
+
+        let text = exportText
             .trim();
 
         const blob = new Blob([text], { type: "text/plain" });
         saveBlob(blob, "transcript.txt");
     };
     const exportJSON = () => {
-        let jsonData = JSON.stringify(transcribedData?.chunks ?? [], null, 2);
+        let jsonData = JSON.stringify(exportSegments, null, 2);
 
         // post-process the JSON to make it more readable
         const regex = /(    "timestamp": )\[\s+(\S+)\s+(\S+)\s+\]/gm;
@@ -57,54 +65,52 @@ export default function Transcript({ transcribedData }: Props) {
 
     // For debugging
     useEffect(() => {
-        console.log('Transcript component received data:', {
-            hasData: !!transcribedData,
-            text: transcribedData?.text?.substring(0, 50) + '...',
-            chunks: transcribedData?.chunks?.length || 0,
-            isBusy: transcribedData?.isBusy
+        console.log('Transcript component received props:', {
+            text: transcriptText?.substring(0, 50) + '...',
+            segmentsCount: segments?.length || 0,
+            transcribedDataAvailable: !!transcribedData
         });
-    }, [transcribedData]);
+    }, [transcriptText, segments, transcribedData]);
 
     return (
         <div
             ref={divRef}
             className='w-full flex flex-col my-2 p-4 max-h-[20rem] overflow-y-auto'
         >
-            {/* Handle the case when we have chunks (like from live transcription) */}
-            {transcribedData?.chunks && transcribedData.chunks.length > 0 ? (
-                transcribedData.chunks.map((chunk, i) => (
+            {/* Display segments if available */}
+            {segments && segments.length > 0 ? (
+                segments.map((segment, i) => (
                     <div
-                        key={`${i}-${chunk.text}`}
+                        key={`segment-${i}-${segment.start}`}
                         className='w-full flex flex-row mb-2 bg-white rounded-lg p-4 shadow-xl shadow-black/5 ring-1 ring-slate-700/10'
                     >
-                        <div className='mr-5 text-gray-600'>
-                            {formatAudioTimestamp(chunk.timestamp[0])} - {chunk.timestamp[1] ? formatAudioTimestamp(chunk.timestamp[1]) : formatAudioTimestamp(chunk.timestamp[0] + 5)}
+                        <div className='mr-5 text-gray-600 tabular-nums'>
+                            {formatAudioTimestamp(segment.start || 0)} - {formatAudioTimestamp(segment.end || (segment.start || 0))}
                         </div>
-                        {chunk.text}
+                        {segment.text}
                     </div>
                 ))
-            ) : (
-                /* Handle the case when we just have plain text (like from file upload) */
-                transcribedData?.text && (
-                    <div className='w-full flex flex-row mb-2 bg-white rounded-lg p-4 shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
-                        <div className='mr-5'>
-                            {formatAudioTimestamp(0)}
-                        </div>
-                        {transcribedData.text}
+            ) : transcriptText ? (
+                /* Fallback to plain text if no segments but text exists */
+                <div className='w-full flex flex-row mb-2 bg-white rounded-lg p-4 shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
+                    <div className='mr-5 text-gray-600 tabular-nums'>
+                        {formatAudioTimestamp(0)} 
                     </div>
-                )
-            )}
+                    {transcriptText}
+                </div>
+            ) : null}
+            {/* End of segment display logic */}
 
             {/* No transcript content message */}
-            {(!transcribedData?.chunks || transcribedData.chunks.length === 0) && 
-             (!transcribedData?.text || transcribedData.text.trim() === '') && (
+            {(!segments || segments.length === 0) && 
+             (!transcriptText || transcriptText.trim() === '') && (
                 <div className='w-full text-center text-gray-500 italic'>
                     No transcript content available
                 </div>
             )}
 
             {/* Export buttons */}
-            {transcribedData && !transcribedData.isBusy && (
+            {(transcriptText || (segments && segments.length > 0)) && ( // Show export if there's any text or segments
                 <div className='w-full text-right mt-4'>
                     <button
                         onClick={exportTXT}

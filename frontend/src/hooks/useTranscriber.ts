@@ -37,10 +37,18 @@ interface TranscriberCompleteData {
     };
 }
 
+export interface TranscriptionSegment {
+    text: string;
+    start?: number;
+    end?: number;
+    timestamp?: [number, number | null];
+}
+
 export interface TranscriberData {
     isBusy: boolean;
     text: string;
-    chunks: { text: string; start?: number; end?: number; timestamp?: [number, number | null] }[];
+    chunks: TranscriptionSegment[];
+    segments?: TranscriptionSegment[];
 }
 
 // Define the return type for transcription results
@@ -405,57 +413,45 @@ export function useTranscriber(): Transcriber {
     }, [engine]);
 
     const stopStreaming = useCallback(async () => {
-        console.log('Stopping streaming');
+        console.log('Stopping streaming and cleaning up resources');
         
-        const ws = webSocketRef.current;
-        if (ws) {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.close();
-            }
-            webSocketRef.current = null;
-        }
-        
+        // First, clear the streaming callback to prevent further updates
+        const currentCallback = streamingCallbackRef.current;
         streamingCallbackRef.current = null;
         
-        console.log('Stopped streaming, audioChunks:', audioChunksRef.current.length);
-        
-        // Save recording if we have audio chunks and we're in live mode
-        if (audioChunksRef.current.length > 0 && isLiveMode) {
-            try {
-                // Create a blob from recorded chunks based on the recorder type (audio/video)
-                const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
-                const isVideo = mimeType.includes('video');
-                const blob = new Blob(audioChunksRef.current, { type: mimeType });
-                
-                console.log(`Created ${isVideo ? 'video' : 'audio'} blob: ${blob.size} bytes`);
-                
-                // Create a file from the blob
-                const fileName = `${isVideo ? 'screen' : 'audio'}-recording-${Date.now()}.webm`;
-                const file = new File([blob], fileName, { type: mimeType });
-                
-                // Create object URL for preview
-                const url = URL.createObjectURL(blob);
-                setRecordedMedia({ url, type: isVideo ? 'video' : 'audio' });
-                
-                console.log(`Live recording saved as ${fileName}`);
-                
-                // If we have transcript content, don't overwrite it with transcription
-                if (!transcript?.text) {
-                    // Transcribe the recording in background
-                    transcribeFile(file).catch(err => {
-                        console.error('Error transcribing saved recording:', err);
-                    });
+        // Close WebSocket connection if it exists
+        if (webSocketRef.current) {
+            const ws = webSocketRef.current;
+            webSocketRef.current = null; // Clear the reference first to prevent race conditions
+            
+            if (ws.readyState === WebSocket.OPEN) {
+                try {
+                    console.log('Closing WebSocket connection');
+                    ws.close();
+                } catch (error) {
+                    console.error('Error closing WebSocket:', error);
                 }
-            } catch (err) {
-                console.error('Error saving live recording:', err);
             }
         }
         
+        // Stop any ongoing media recording
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            try {
+                console.log('Stopping media recorder');
+                mediaRecorderRef.current.stop();
+            } catch (error) {
+                console.error('Error stopping media recorder:', error);
+            }
+        }
         
-        // Close WebSocket connection
-        if (webSocketRef.current) {
-            webSocketRef.current.close();
-            webSocketRef.current = null;
+        // Stop all media tracks
+        if (streamRef.current) {
+            console.log('Stopping all media tracks');
+            streamRef.current.getTracks().forEach(track => {
+                track.stop();
+                track.enabled = false;
+            });
+            streamRef.current = null;
         }
         
         // Reset audio chunks array
@@ -463,14 +459,23 @@ export function useTranscriber(): Transcriber {
         
         // Stop server-side transcription
         try {
+            console.log('Sending stop request to server');
             await axios.post('http://localhost:8000/transcriber/stop');
-            console.log('Transcription stopped');
-            streamingCallbackRef.current = null;
+            console.log('Server transcription stopped');
         } catch (error) {
-            console.error('Error stopping transcription:', error);
-        } finally {
-            setIsBusy(false);
+            console.error('Error stopping server transcription:', error);
         }
+        
+        // Clear any pending transcription state
+        if (currentCallback) {
+            currentCallback(''); // Clear the transcription with empty string
+        }
+        
+        // Reset recording state
+        setIsRecording(false);
+        setIsBusy(false);
+        
+        console.log('Streaming and transcription fully stopped');
     }, [isLiveMode, transcript, transcribeFile]);
     
     // Recording functions
@@ -515,12 +520,15 @@ export function useTranscriber(): Transcriber {
             // If live mode is enabled, start streaming
             if (isLiveMode) {
                 console.log('Live mode enabled, starting streaming transcription');
-                startStreaming((text) => {
-                    setTranscript(prev => ({
-                        isBusy: true,
-                        text: prev?.text ? `${prev.text}\n${text}` : text,
-                        chunks: [],
-                    }));
+                startStreaming((text, segments) => {
+                    // Only update if we still have a valid callback (streaming is active)
+                    if (streamingCallbackRef.current) {
+                        setTranscript(prev => ({
+                            isBusy: true,
+                            text: text, // Only show the latest text, don't accumulate
+                            chunks: segments || [],
+                        }));
+                    }
                 });
             }
         } catch (error) {
@@ -530,21 +538,53 @@ export function useTranscriber(): Transcriber {
         }
     }, [isLiveMode, startStreaming, transcribeFile]);
     
-    const stopRecording = useCallback(() => {
-        if (mediaRecorderRef.current) {
-            mediaRecorderRef.current.stop();
-            
-            if (streamRef.current) {
-                streamRef.current.getTracks().forEach(track => track.stop());
+    const stopRecording = useCallback(async () => {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            try {
+                console.log('Stopping media recorder and cleaning up');
+                const recorder = mediaRecorderRef.current;
+                
+                // Stop the media recorder
+                return new Promise<void>((resolve) => {
+                    const onStop = () => {
+                        recorder.removeEventListener('stop', onStop);
+                        console.log('Media recorder stopped');
+                        
+                        // Stop all tracks in the stream
+                        if (streamRef.current) {
+                            streamRef.current.getTracks().forEach(track => {
+                                track.stop();
+                                track.enabled = false;
+                            });
+                            streamRef.current = null;
+                        }
+                        
+                        // Stop streaming if live mode was enabled
+                        if (isLiveMode) {
+                            console.log('Stopping live streaming');
+                            stopStreaming().finally(() => {
+                                setIsRecording(false);
+                                console.log('Recording and streaming fully stopped');
+                                resolve();
+                            });
+                        } else {
+                            setIsRecording(false);
+                            console.log('Recording stopped');
+                            resolve();
+                        }
+                    };
+                    
+                    recorder.addEventListener('stop', onStop);
+                    recorder.stop();
+                });
+            } catch (error) {
+                console.error('Error stopping recording:', error);
+                setIsRecording(false);
+                return Promise.resolve();
             }
-            
-            // Stop streaming if live mode was enabled
-            if (isLiveMode) {
-                stopStreaming();
-            }
-            
-            setIsRecording(false);
-            console.log('Recording stopped');
+        } else {
+            console.log('No active recording to stop');
+            return Promise.resolve();
         }
     }, [isLiveMode, stopStreaming]);
     
