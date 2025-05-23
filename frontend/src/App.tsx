@@ -96,7 +96,7 @@ function App() {
   const [systemAudioAvailable, setSystemAudioAvailable] = useState<boolean>(false);
   const [audioStreamType, setAudioStreamType] = useState<'mic-only' | 'system-only' | 'combined'>('combined');
   
-  // Improved WebSocket management
+  // Improved WebSocket management for live transcription
   const webSocketRef = useRef<WebSocket | null>(null);
   const webSocketSessionId = useRef<string | null>(null);
   const isLiveTranscriptionActive = useRef<boolean>(false);
@@ -107,6 +107,11 @@ function App() {
   const micStreamRef = useRef<MediaStream | null>(null);
   const systemStreamRef = useRef<MediaStream | null>(null);
   const combinedStreamRef = useRef<MediaStream | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  
+  // Audio processing for live transcription
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const lastAudioSendTime = useRef<number>(0);
 
   // Summary Generation - now uses direct response from Ollama API
   const generateSummaryFromAPI = async (transcript: string) => {
@@ -316,32 +321,10 @@ function App() {
     // Simply return the text for HTML content
     return text;
   };
-  
-  // Audio resampling utility function
-  const resampleAudio = useCallback((audioData: Float32Array, fromSampleRate: number, toSampleRate: number): Float32Array => {
-    if (fromSampleRate === toSampleRate) {
-      return audioData;
-    }
 
-    const ratio = fromSampleRate / toSampleRate;
-    const newLength = Math.round(audioData.length / ratio);
-    const result = new Float32Array(newLength);
-
-    for (let i = 0; i < newLength; i++) {
-      const srcIndex = i * ratio;
-      const srcIndexFloor = Math.floor(srcIndex);
-      const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
-      const fraction = srcIndex - srcIndexFloor;
-      
-      result[i] = audioData[srcIndexFloor] * (1 - fraction) + audioData[srcIndexCeil] * fraction;
-    }
-
-    return result;
-  }, []);
-
-  // Audio context utility function
+  // Enhanced audio utility functions
   const createAudioContext = useCallback(() => {
-    if (!audioContextRef.current) {
+    if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
     return audioContextRef.current;
@@ -394,7 +377,7 @@ function App() {
         systemGain.gain.value = 1.2; // Boost system audio slightly as it's often quieter
         systemSource.connect(systemGain);
         systemGain.connect(destination);
-        console.log('Connected system audio to combined stream');
+        console.log('Connected system audio with gain boost');
       }
       
       setAudioStreamType('combined');
@@ -409,14 +392,14 @@ function App() {
     }
   }, [createAudioContext]);
 
-  // Improved WebSocket connection management
+  // Improved WebSocket connection management for live transcription
   const initializeWebSocketConnection = useCallback(() => {
     if (webSocketRef.current) {
       console.log('WebSocket already exists, cleaning up first');
       cleanupWebSocket();
     }
 
-    console.log('Initializing new WebSocket connection');
+    console.log('Initializing new WebSocket connection for live transcription');
     
     const wsUrl = `ws://localhost:8000/transcriber/ws?engine=faster-whisper`;
     const ws = new WebSocket(wsUrl);
@@ -427,7 +410,7 @@ function App() {
     processedSegmentIds.current.clear();
     
     ws.onopen = () => {
-      console.log('WebSocket connection established');
+      console.log('✅ Live transcription WebSocket connection established');
       // Send configuration
       ws.send(JSON.stringify({
         engine: 'faster_whisper',
@@ -457,7 +440,7 @@ function App() {
         }
         
         if (data.segments && Array.isArray(data.segments)) {
-          console.log(`Received ${data.segments.length} new segments`);
+          console.log(`Received ${data.segments.length} new segments from live transcription`);
           
           // Process new segments with improved deduplication
           const newValidSegments: TranscriptSegment[] = [];
@@ -469,6 +452,24 @@ function App() {
             
             // Skip empty or very short segments
             if (!segmentText || segmentText.length < 3) {
+              continue;
+            }
+            
+            // Skip common Whisper hallucinations
+            const hallucinations = [
+              'thanks for watching', 'thank you for watching', 
+              'bye', 'goodbye', 'see you later',
+              'subscribe', 'like and subscribe',
+              'thanks', 'thank you', 'music',
+              'applause', '[music]', '[applause]',
+              '♪', 'mm', 'hmm', 'uh', 'um',
+              'you', 'the', 'and', 'a'
+            ];
+            
+            if (hallucinations.includes(segmentText.toLowerCase()) || 
+                segmentText.length < 3 || 
+                /^[♪\[\]()]+$/.test(segmentText)) {
+              console.log(`Filtering out likely hallucination: "${segmentText}"`);
               continue;
             }
             
@@ -501,9 +502,11 @@ function App() {
               const fullText = updatedSegments.map(seg => seg.text).join(' ');
               setLiveTranscript(fullText);
               
-              console.log(`Added ${newValidSegments.length} new segments, total: ${updatedSegments.length}`);
+              console.log(`✅ Added ${newValidSegments.length} new segments, total: ${updatedSegments.length}`);
               return updatedSegments;
             });
+          } else {
+            console.log('No valid segments after filtering hallucinations');
           }
         }
       } catch (error) {
@@ -557,8 +560,14 @@ function App() {
   }, []);
 
   // Cleanup audio streams function
-  const cleanupAudioStreams = useCallback(() => {
+  const cleanupAudioResources = useCallback(() => {
     console.log('Cleaning up audio streams and context');
+    
+    // Stop audio processor
+    if (audioProcessorRef.current) {
+      audioProcessorRef.current.disconnect();
+      audioProcessorRef.current = null;
+    }
     
     // Stop all stream tracks
     [micStreamRef, systemStreamRef, combinedStreamRef, streamRef].forEach(streamRef => {
@@ -585,9 +594,9 @@ function App() {
   useEffect(() => {
     return () => {
       cleanupWebSocket();
-      cleanupAudioStreams();
+      cleanupAudioResources();
     };
-  }, [cleanupWebSocket, cleanupAudioStreams]);
+  }, [cleanupWebSocket, cleanupAudioResources]);
 
   const startAudioRecording = (withLiveTranscript: boolean): void => {
     if (isRecording) {
@@ -779,14 +788,137 @@ function App() {
     }
   };
 
-  // Enhanced screen recording with proper live audio streaming
+  // NEW: Send audio data directly to WebSocket for live transcription
+  const sendAudioToWebSocket = useCallback((audioData: Float32Array) => {
+    if (!webSocketRef.current || webSocketRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    try {
+      // Skip if audio is too quiet (avoid hallucinations)
+      const audioLevel = Math.sqrt(audioData.reduce((sum, x) => sum + x * x, 0) / audioData.length);
+      if (audioLevel < 0.01) {
+        return; // Skip silent audio to avoid hallucinations
+      }
+
+      // Downsample to 16kHz for Whisper
+      const targetSampleRate = 16000;
+      const sourceSampleRate = audioContextRef.current?.sampleRate || 44100;
+      let processedAudio = audioData;
+      
+      if (sourceSampleRate !== targetSampleRate) {
+        const ratio = sourceSampleRate / targetSampleRate;
+        const newLength = Math.floor(audioData.length / ratio);
+        const downsampled = new Float32Array(newLength);
+        
+        for (let i = 0; i < newLength; i++) {
+          const sourceIndex = Math.floor(i * ratio);
+          downsampled[i] = audioData[sourceIndex];
+        }
+        processedAudio = downsampled;
+      }
+
+      // Send audio data to WebSocket
+      const message = {
+        type: 'audio_data',
+        audio: Array.from(processedAudio),
+        sample_rate: targetSampleRate,
+        timestamp: Date.now()
+      };
+
+      webSocketRef.current.send(JSON.stringify(message));
+      console.log(`Sent ${processedAudio.length} audio samples for live transcription`);
+      
+    } catch (error) {
+      console.error('Error sending audio to WebSocket:', error);
+    }
+  }, []);
+
+  // NEW: Setup real-time audio processing for live transcription during screen recording
+  const setupLiveAudioProcessing = useCallback((audioStream: MediaStream) => {
+    if (!audioStream || audioStream.getAudioTracks().length === 0) {
+      console.warn('No audio tracks available for live processing');
+      return;
+    }
+
+    try {
+      console.log('🎙️ Setting up live audio processing for screen recording');
+      
+      const audioContext = createAudioContext();
+      
+      // Resume audio context if suspended
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+
+      // Create source from the audio stream
+      const source = audioContext.createMediaStreamSource(audioStream);
+      
+      // Create script processor for real-time audio processing
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      audioProcessorRef.current = processor;
+      
+      // Buffer to accumulate audio data
+      let audioBuffer: Float32Array[] = [];
+      let bufferDuration = 0;
+      const targetDuration = 3; // seconds
+      const sampleRate = audioContext.sampleRate;
+
+      processor.onaudioprocess = (event) => {
+        if (!isLiveTranscriptionActive.current || !isScreenRecording) {
+          return;
+        }
+
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0);
+        
+        // Copy audio data to buffer
+        const chunk = new Float32Array(inputData.length);
+        chunk.set(inputData);
+        audioBuffer.push(chunk);
+        
+        bufferDuration += inputData.length / sampleRate;
+        
+        // When we have enough audio, send it for transcription
+        if (bufferDuration >= targetDuration) {
+          // Combine all audio chunks
+          const totalLength = audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+          const combinedAudio = new Float32Array(totalLength);
+          
+          let offset = 0;
+          for (const chunk of audioBuffer) {
+            combinedAudio.set(chunk, offset);
+            offset += chunk.length;
+          }
+          
+          // Send to WebSocket for live transcription
+          sendAudioToWebSocket(combinedAudio);
+          
+          // Clear buffer
+          audioBuffer = [];
+          bufferDuration = 0;
+        }
+      };
+
+      // Connect the audio processing chain
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      console.log('✅ Live audio processing setup completed');
+      
+    } catch (error) {
+      console.error('Error setting up live audio processing:', error);
+    }
+  }, [createAudioContext, sendAudioToWebSocket, isLiveTranscriptionActive, isScreenRecording]);
+
+  // Enhanced screen recording with better live transcription
   const startScreenRecording = async (withLiveTranscript: boolean) => {
     if (isScreenRecording) {
       console.log('Already screen recording.');
       return;
     }
     
-    console.log(`Starting enhanced screen recording with live transcript: ${withLiveTranscript}`);
+    console.log(`🎬 Starting enhanced screen recording with live transcript: ${withLiveTranscript}`);
     setIsScreenRecording(true);
     setError('');
     
@@ -795,7 +927,7 @@ function App() {
     setLiveSegments([]);
     setLiveTranscript('');
     processedSegmentIds.current.clear();
-    cleanupAudioStreams(); // Clean up any existing streams
+    cleanupAudioResources(); // Clean up any existing streams
     
     setIsLiveMode(withLiveTranscript);
 
@@ -903,13 +1035,13 @@ function App() {
 
       console.log(`Final stream created with ${finalCombinedStream.getVideoTracks().length} video tracks and ${finalCombinedStream.getAudioTracks().length} audio tracks`);
 
-      // Step 5: Initialize WebSocket for live transcription BEFORE starting recording
+      // Step 5: Initialize WebSocket and live audio processing BEFORE starting recording
       if (withLiveTranscript) {
-        console.log('Step 5a: Starting live transcription WebSocket for screen recording');
+        console.log('🔴 Step 5: Starting live transcription for screen recording');
         initializeWebSocketConnection();
         
-        // Step 5b: Set up audio processing for live transcription
-        await setupLiveAudioProcessing(finalAudioStream);
+        // Setup real-time audio processing for live transcription
+        setupLiveAudioProcessing(finalAudioStream);
       }
 
       console.log('Step 6: Setting up MediaRecorder...');
@@ -1018,7 +1150,7 @@ function App() {
         }
         
         // Cleanup all streams
-        cleanupAudioStreams();
+        cleanupAudioResources();
         
         // Cleanup live transcription if it was active
         if (withLiveTranscript) {
@@ -1068,147 +1200,12 @@ function App() {
       setIsLiveMode(false);
       
       // Cleanup on error
-      cleanupAudioStreams();
+      cleanupAudioResources();
       if (withLiveTranscript) {
         cleanupWebSocket();
       }
     }
   };
-
-  // NEW: Send audio data to WebSocket for transcription
-  const sendAudioForTranscription = useCallback((audioChunks: Float32Array[], sampleRate: number) => {
-    if (!webSocketRef.current || webSocketRef.current.readyState !== WebSocket.OPEN) {
-      console.warn('WebSocket not ready for audio data');
-      return;
-    }
-
-    try {
-      // Combine all audio chunks
-      const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      const combinedAudio = new Float32Array(totalLength);
-      
-      let offset = 0;
-      for (const chunk of audioChunks) {
-        combinedAudio.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      // Convert to 16kHz mono for Whisper (if needed)
-      let processedAudio = combinedAudio;
-      if (sampleRate !== 16000) {
-        processedAudio = resampleAudio(combinedAudio, sampleRate, 16000);
-      }
-
-      // Convert Float32Array to ArrayBuffer
-      const audioBuffer = new ArrayBuffer(processedAudio.length * 4);
-      const view = new Float32Array(audioBuffer);
-      view.set(processedAudio);
-
-      // Send audio data to WebSocket
-      const message = {
-        type: 'audio_data',
-        audio: Array.from(processedAudio), // Convert to regular array for JSON
-        sample_rate: 16000,
-        timestamp: Date.now()
-      };
-
-      webSocketRef.current.send(JSON.stringify(message));
-      console.log(`Sent ${processedAudio.length} audio samples for live transcription`);
-      
-    } catch (error) {
-      console.error('Error sending audio for transcription:', error);
-    }
-  }, []);
-
-  // NEW: Simple audio resampling function
-  const resampleAudio = useCallback((audioData: Float32Array, fromSampleRate: number, toSampleRate: number): Float32Array => {
-    if (fromSampleRate === toSampleRate) {
-      return audioData;
-    }
-
-    const ratio = fromSampleRate / toSampleRate;
-    const newLength = Math.round(audioData.length / ratio);
-    const result = new Float32Array(newLength);
-
-    for (let i = 0; i < newLength; i++) {
-      const srcIndex = i * ratio;
-      const srcIndexFloor = Math.floor(srcIndex);
-      const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
-      const fraction = srcIndex - srcIndexFloor;
-      
-      result[i] = audioData[srcIndexFloor] * (1 - fraction) + audioData[srcIndexCeil] * fraction;
-    }
-
-    return result;
-  }, []);
-
-  // NEW: Setup live audio processing for real-time transcription
-  const setupLiveAudioProcessing = useCallback(async (audioStream: MediaStream) => {
-    if (!audioStream || audioStream.getAudioTracks().length === 0) {
-      console.warn('No audio tracks available for live processing');
-      return;
-    }
-
-    try {
-      console.log('Setting up live audio processing for screen recording');
-      
-      // Create audio context for processing
-      const audioContext = createAudioContext();
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-      }
-
-      // Create analyser and processor nodes
-      const source = audioContext.createMediaStreamSource(audioStream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      
-      // Buffer to accumulate audio data
-      let audioBuffer: Float32Array[] = [];
-      let bufferDuration = 0;
-      const targetDuration = 3; // seconds
-      const sampleRate = audioContext.sampleRate;
-
-      processor.onaudioprocess = (event) => {
-        if (!isLiveTranscriptionActive.current || !isScreenRecording) {
-          return;
-        }
-
-        const inputBuffer = event.inputBuffer;
-        const inputData = inputBuffer.getChannelData(0);
-        
-        // Only process if there's actual audio (not silence)
-        const audioLevel = Math.sqrt(inputData.reduce((sum, x) => sum + x * x, 0) / inputData.length);
-        
-        if (audioLevel > 0.001) { // Threshold to avoid processing silence
-          // Copy audio data to buffer
-          const chunk = new Float32Array(inputData.length);
-          chunk.set(inputData);
-          audioBuffer.push(chunk);
-          
-          bufferDuration += inputData.length / sampleRate;
-          
-          // When we have enough audio, send it for transcription
-          if (bufferDuration >= targetDuration) {
-            sendAudioForTranscription(audioBuffer, sampleRate);
-            audioBuffer = [];
-            bufferDuration = 0;
-          }
-        }
-      };
-
-      // Connect the audio processing chain
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      console.log('Live audio processing setup completed');
-      
-      // Store references for cleanup
-      audioContextRef.current = audioContext;
-      
-    } catch (error) {
-      console.error('Error setting up live audio processing:', error);
-    }
-  }, [createAudioContext, sendAudioForTranscription]);
 
   const stopScreenRecording = useCallback(() => {
     console.log('Stopping screen recording...');
@@ -1225,15 +1222,15 @@ function App() {
       screenMediaRecorderRef.current = null;
     }
     
-    // Cleanup all audio streams
-    cleanupAudioStreams();
+    // Cleanup all audio resources
+    cleanupAudioResources();
     
     // Cleanup WebSocket connection
     cleanupWebSocket();
     
     setIsLiveMode(false);
     console.log('Screen recording cleanup completed');
-  }, [cleanupWebSocket, cleanupAudioStreams]);
+  }, [cleanupWebSocket, cleanupAudioResources]);
 
   const stopAudioRecording = (): void => {
     console.log('stopAudioRecording called. Current state:', mediaRecorderRef.current?.state);
@@ -1576,7 +1573,11 @@ function App() {
                 <div className="text-gray-500 italic flex items-center justify-center h-20">
                   <div className="flex items-center">
                     <div className="w-2 h-2 bg-blue-500 rounded-full mr-2 animate-pulse"></div>
-                    <span>Listening for speech...</span>
+                    <span>
+                      {isLiveTranscriptionActive.current 
+                        ? 'Listening for speech...' 
+                        : 'Connecting to live transcription...'}
+                    </span>
                   </div>
                 </div>
               )}
