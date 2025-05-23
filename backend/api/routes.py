@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import shutil
+import numpy as np
 from typing import Optional, Union, List, Dict, Any
 from api.ollama_handler import generate_response
 from api.faster_transcription import FasterTranscriber, get_transcriber
@@ -344,9 +345,124 @@ async def stop_transcription():
         logger.error(f"Error stopping transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def handle_audio_data(session_state: dict, data: dict):
+    """Handle incoming audio data and perform transcription."""
+    try:
+        audio_array = data.get("audio", [])
+        sample_rate = data.get("sample_rate", 16000)
+        timestamp = data.get("timestamp", time())
+        
+        if not audio_array:
+            return
+        
+        # Convert to numpy array
+        audio_np = np.array(audio_array, dtype=np.float32)
+        
+        # Add to buffer
+        session_state["audio_buffer"].append(audio_np)
+        
+        # Process when we have enough audio (about 2.5 seconds)
+        total_duration = sum(len(chunk) for chunk in session_state["audio_buffer"]) / sample_rate
+        
+        if total_duration >= 2.5:  # Process every 2.5 seconds for good real-time response
+            # Combine all audio chunks
+            combined_audio = np.concatenate(session_state["audio_buffer"])
+            
+            # Skip if audio is too quiet (likely silence or noise)
+            audio_level = np.sqrt(np.mean(combined_audio ** 2))
+            
+            if audio_level > 0.005:  # Threshold to avoid processing silence
+                try:
+                    # Get transcriber
+                    transcriber = session_state["transcriber"]
+                    
+                    if transcriber and transcriber.model:
+                        # Transcribe the audio chunk
+                        segments, info = transcriber.model.transcribe(
+                            combined_audio,
+                            language="en",
+                            beam_size=3,  # Fast processing
+                            vad_filter=True,
+                            vad_parameters=dict(
+                                min_silence_duration_ms=500,
+                                speech_pad_ms=200
+                            )
+                        )
+                        
+                        # Process segments
+                        new_segments = []
+                        current_time = time() - session_state["start_time"]
+                        
+                        for segment in segments:
+                            segment_text = segment.text.strip()
+                            
+                            # Skip very short or empty segments
+                            if len(segment_text) < 3:
+                                continue
+                            
+                            # Skip common hallucinations that Whisper generates
+                            hallucinations = [
+                                "thanks for watching", "thank you for watching", 
+                                "bye", "goodbye", "see you later",
+                                "subscribe", "like and subscribe",
+                                "thanks", "thank you", "music",
+                                "applause", "[music]", "[applause]"
+                            ]
+                            
+                            if segment_text.lower() in hallucinations:
+                                logger.debug(f"Skipping likely hallucination: {segment_text}")
+                                continue
+                            
+                            # Create segment with proper timestamps
+                            segment_start = current_time + segment.start
+                            segment_end = current_time + segment.end
+                            
+                            segment_data = {
+                                "text": segment_text,
+                                "start": segment_start,
+                                "end": segment_end
+                            }
+                            
+                            new_segments.append(segment_data)
+                        
+                        # Send results if we have new segments
+                        if new_segments:
+                            # Update session state
+                            session_state["current_segments"].extend(new_segments)
+                            all_text = " ".join(seg["text"] for seg in session_state["current_segments"])
+                            session_state["current_text"] = all_text
+                            
+                            # Send to client
+                            result = {
+                                "text": all_text,
+                                "segments": new_segments,  # Only new segments
+                                "timestamp": timestamp,
+                                "is_partial": True,
+                                "session_id": session_state.get("session_id", "unknown")
+                            }
+                            
+                            try:
+                                await session_state["websocket"].send_text(json.dumps(result))
+                                logger.info(f"Sent {len(new_segments)} new segments to client")
+                            except Exception as e:
+                                logger.error(f"Error sending transcription result: {e}")
+                        else:
+                            logger.debug("No valid segments found in audio chunk")
+                            
+                except Exception as e:
+                    logger.error(f"Error transcribing audio chunk: {e}")
+            else:
+                logger.debug(f"Audio too quiet (level: {audio_level:.6f}), skipping transcription")
+            
+            # Clear buffer after processing
+            session_state["audio_buffer"] = []
+            
+    except Exception as e:
+        logger.error(f"Error handling audio data: {e}")
+
 @app.websocket("/transcriber/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time transcription results with improved session management."""
+    """Enhanced WebSocket endpoint for real-time transcription with direct audio streaming."""
     session_id = f"session_{int(time() * 1000)}"
     
     await websocket.accept()
@@ -360,7 +476,10 @@ async def websocket_endpoint(websocket: WebSocket):
         "current_text": "",
         "current_segments": [],
         "websocket": websocket,
-        "last_chunk_id": 0
+        "last_chunk_id": 0,
+        "audio_buffer": [],
+        "start_time": time(),
+        "session_id": session_id
     }
     
     live_transcription_sessions[session_id] = session_state
@@ -372,11 +491,11 @@ async def websocket_endpoint(websocket: WebSocket):
         
         logger.info(f"Initializing session {session_id} with engine: {engine}")
         
-        # Initialize transcriber with improved settings - REMOVED ENGINE PARAMETER
+        # Initialize transcriber with settings optimized for live transcription
         config = {
             'model_name': 'base',
             'language': 'en',
-            'chunk_duration_ms': 2000,  # Reduced chunk duration for better real-time response
+            'chunk_duration_ms': 1500,  # Shorter chunks for better real-time response
             'compute_type': 'int8',
             'device_type': 'cpu'
         }
@@ -384,114 +503,42 @@ async def websocket_endpoint(websocket: WebSocket):
         transcriber = FasterTranscriber(**config)
         session_state["transcriber"] = transcriber
         
-        # Start transcription
-        transcriber.start()
-        logger.info(f"Real-time transcription started for session {session_id}")
+        logger.info(f"Real-time transcription initialized for session {session_id}")
         
-        # Main loop to send transcription results
-        last_update_time = time()
-        consecutive_empty_results = 0
-        
+        # Main message handling loop
         while session_state["is_active"]:
             try:
-                # Check if WebSocket is still connected
-                if websocket.client_state.name != "CONNECTED":
-                    logger.info(f"WebSocket disconnected for session {session_id}")
-                    break
-                
-                # Get the latest result from transcriber (non-blocking)
-                result = transcriber.get_latest_result(block=False)
-                
-                if result and isinstance(result, dict):
-                    current_time = time()
+                # Wait for message with timeout
+                try:
+                    message = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                    data = json.loads(message)
                     
-                    # Extract new segments from result
-                    raw_segments = result.get("segments", [])
-                    complete_text = result.get("text", "")
-                    chunk_id = result.get("chunk_id", 0)
-                    
-                    # Use chunk_id to prevent duplicates
-                    if chunk_id > session_state["last_chunk_id"]:
-                        session_state["last_chunk_id"] = chunk_id
-                        
-                        if raw_segments or (complete_text and complete_text.strip() != session_state["current_text"].strip()):
-                            # Process segments to avoid duplicates using chunk-based deduplication
-                            new_segments = []
-                            
-                            for segment in raw_segments:
-                                segment_text = segment.get("text", "").strip()
-                                segment_start = segment.get("start", 0)
-                                segment_end = segment.get("end", segment_start)
-                                
-                                # Create a segment ID based on chunk and content
-                                segment_id = f"chunk_{chunk_id}_{segment_text}_{segment_start:.2f}"
-                                
-                                # Only process if we haven't seen this segment before
-                                if segment_id not in session_state["processed_segments"]:
-                                    session_state["processed_segments"].add(segment_id)
-                                    
-                                    # Format segment for frontend
-                                    formatted_segment = {
-                                        "text": segment_text,
-                                        "start": segment_start,
-                                        "end": segment_end
-                                    }
-                                    
-                                    if formatted_segment["text"]:  # Only add non-empty segments
-                                        new_segments.append(formatted_segment)
-                            
-                            # Update session state
-                            if new_segments:
-                                session_state["current_segments"].extend(new_segments)
-                                session_state["current_text"] = complete_text
-                                
-                                # Send result to client
-                                formatted_result = {
-                                    "text": complete_text,
-                                    "segments": new_segments,  # Send only new segments
-                                    "timestamp": current_time,
-                                    "is_partial": True,
-                                    "session_id": session_id,
-                                    "chunk_id": chunk_id
-                                }
-                                
-                                await websocket.send_text(json.dumps(formatted_result))
-                                logger.info(f"Session {session_id}: Sent {len(new_segments)} new segments from chunk {chunk_id}")
-                                
-                                last_update_time = current_time
-                                consecutive_empty_results = 0
-                            else:
-                                consecutive_empty_results += 1
-                        else:
-                            consecutive_empty_results += 1
-                    else:
-                        # Old chunk, ignore
-                        consecutive_empty_results += 1
-                else:
-                    consecutive_empty_results += 1
-                
-                # If no results for a while, send a heartbeat
-                if time() - last_update_time > 10.0:
-                    try:
-                        await websocket.send_text(json.dumps({
-                            "heartbeat": True, 
-                            "session_id": session_id,
-                            "timestamp": time()
-                        }))
-                        last_update_time = time()
-                    except:
-                        logger.info(f"Failed to send heartbeat to session {session_id}, connection likely closed")
+                    if data.get("type") == "audio_data":
+                        # Handle incoming audio data for live transcription
+                        await handle_audio_data(session_state, data)
+                    elif data.get("command") == "stop":
+                        logger.info(f"Received stop command for session {session_id}")
                         break
-                
-                # Small delay to prevent overwhelming the connection
-                await asyncio.sleep(0.1)
+                    else:
+                        logger.debug(f"Received configuration update: {data}")
+                        
+                except asyncio.TimeoutError:
+                    # Send heartbeat if no messages received
+                    if session_state["is_active"]:
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "heartbeat": True,
+                                "session_id": session_id,
+                                "timestamp": time()
+                            }))
+                        except:
+                            logger.info(f"Failed to send heartbeat, connection likely closed: {session_id}")
+                            break
                 
             except Exception as e:
-                logger.error(f"Error processing transcription result for session {session_id}: {e}")
-                await asyncio.sleep(0.5)  # Longer delay on error
+                logger.error(f"Error processing message for session {session_id}: {e}")
+                await asyncio.sleep(0.1)
                 
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket client disconnected: {session_id}")
     except Exception as e:
         logger.error(f"Error in WebSocket connection {session_id}: {e}")
         try:

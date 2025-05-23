@@ -59,6 +59,14 @@ interface TranscriptionResult {
     chunks?: { text: string; start?: number; end?: number; timestamp?: [number, number | null] }[];
 }
 
+// Enhanced audio stream interface
+interface AudioStreamInfo {
+    hasSystemAudio: boolean;
+    hasMicAudio: boolean;
+    streamType: 'mic-only' | 'system-only' | 'combined';
+    quality: 'low' | 'medium' | 'high';
+}
+
 export interface Transcriber {
     onInputChange: () => void;
     isBusy: boolean;
@@ -91,23 +99,31 @@ export interface Transcriber {
     isRecording: boolean;
     recordedMedia: { url: string, type: string } | null;
     
+    // Enhanced audio info
+    audioStreamInfo: AudioStreamInfo;
+    
     // File transcription
     transcribeFile: (file: File) => Promise<TranscriptionResult>;
     
-    // Live streaming functionality
+    // Enhanced live streaming functionality
     startStreaming: (updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, options?: {
         captureBothIO?: boolean;
         inputDevice?: string | number | null;
         outputDevice?: string | number | null;
+        preferSystemAudio?: boolean;
     }) => void;
     stopStreaming: () => void;
     
-    // Recording functionality
-    startRecording: () => void;
+    // Enhanced recording functionality
+    startRecording: (options?: { captureSystemAudio?: boolean }) => void;
     stopRecording: () => void;
     
-    // Screen recording
-    startScreenRecording: () => void;
+    // Enhanced screen recording
+    startScreenRecording: (options?: { 
+        preferSystemAudio?: boolean;
+        combineWithMic?: boolean;
+        quality?: 'low' | 'medium' | 'high';
+    }) => void;
     stopScreenRecording: () => void;
 }
 
@@ -120,12 +136,20 @@ export function useTranscriber(): Transcriber {
     const [isLiveMode, setIsLiveMode] = useState(false);
     const [recordedMedia, setRecordedMedia] = useState<{ url: string, type: string } | null>(null);
     
-    // Engine selection based on mode: faster-whisper for standard, whisper (OpenAI local) for live
+    // Enhanced audio stream tracking
+    const [audioStreamInfo, setAudioStreamInfo] = useState<AudioStreamInfo>({
+        hasSystemAudio: false,
+        hasMicAudio: false,
+        streamType: 'combined',
+        quality: 'medium'
+    });
+    
+    // Engine selection - use faster_whisper for both modes for consistency
     const [engine, setEngineState] = useState<string>("faster_whisper");
     
     // Update engine based on live mode
     useEffect(() => {
-        const newEngine = isLiveMode ? "whisper" : "faster_whisper";
+        const newEngine = "faster_whisper"; // Use faster_whisper for both modes
         console.log(`Setting engine to ${newEngine} based on isLiveMode=${isLiveMode}`);
         setEngineState(newEngine);
     }, [isLiveMode]);
@@ -142,9 +166,195 @@ export function useTranscriber(): Transcriber {
     const [multilingual, setMultilingual] = useState<boolean>(Constants.DEFAULT_MULTILINGUAL);
     const [language, setLanguage] = useState<string>(Constants.DEFAULT_LANGUAGE);
     
-    // WebSocket reference for streaming audio
+    // Enhanced WebSocket and audio management
     const webSocketRef = useRef<WebSocket | null>(null);
     const isStreamingRef = useRef<boolean>(false);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const micStreamRef = useRef<MediaStream | null>(null);
+    const systemStreamRef = useRef<MediaStream | null>(null);
+    const combinedStreamRef = useRef<MediaStream | null>(null);
+    const streamingCallbackRef = useRef<((text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void) | null>(null);
+    
+    // Media recorder for enhanced audio/screen recording
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+    const audioChunksRef = useRef<Blob[]>([]);
+    const [error, setError] = useState<string>('');
+
+    // Enhanced audio utility functions
+    const createAudioContext = useCallback(() => {
+        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+            audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        return audioContextRef.current;
+    }, []);
+
+    const detectAudioCapabilities = useCallback(async (): Promise<{canCaptureSystemAudio: boolean, canCaptureMic: boolean}> => {
+        let canCaptureSystemAudio = false;
+        let canCaptureMic = false;
+
+        // Test microphone access
+        try {
+            const testMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            canCaptureMic = true;
+            testMicStream.getTracks().forEach(track => track.stop());
+        } catch (error) {
+            console.warn('Microphone access not available:', error);
+        }
+
+        // Test system audio capture by checking if getDisplayMedia is a function
+        // and if the browser supports audio capture (this is the most reliable way)
+        try {
+            if (navigator.mediaDevices && 
+                typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+                // Check if the browser supports audio in getDisplayMedia
+                // by creating a test stream (this won't actually request permissions)
+                const testStream = await navigator.mediaDevices.getDisplayMedia({ 
+                    video: true,
+                    audio: true 
+                }).catch(() => null);
+                
+                if (testStream) {
+                    // Check if we actually got an audio track
+                    const hasAudio = testStream.getAudioTracks().length > 0;
+                    testStream.getTracks().forEach(track => track.stop());
+                    canCaptureSystemAudio = hasAudio;
+                }
+            }
+        } catch (error) {
+            console.warn('System audio capture not available:', error);
+            canCaptureSystemAudio = false;
+        }
+
+        return { canCaptureSystemAudio, canCaptureMic };
+    }, []);
+
+    const combineAudioStreams = useCallback(async (
+        micStream: MediaStream | null, 
+        systemStream: MediaStream | null,
+        options?: { micGain?: number; systemGain?: number }
+    ): Promise<MediaStream> => {
+        console.log('Enhanced audio stream combination:', { 
+            micTracks: micStream?.getAudioTracks().length || 0, 
+            systemTracks: systemStream?.getAudioTracks().length || 0,
+            options 
+        });
+
+        if (!micStream && !systemStream) {
+            throw new Error('No audio streams available to combine');
+        }
+
+        // Update audio stream info
+        const newStreamInfo: AudioStreamInfo = {
+            hasSystemAudio: !!(systemStream?.getAudioTracks().length),
+            hasMicAudio: !!(micStream?.getAudioTracks().length),
+            streamType: 'combined',
+            quality: 'high'
+        };
+
+        // If only one stream is available, return it directly
+        if (!micStream && systemStream) {
+            console.log('Using system audio only');
+            newStreamInfo.streamType = 'system-only';
+            setAudioStreamInfo(newStreamInfo);
+            return systemStream;
+        }
+        
+        if (micStream && !systemStream) {
+            console.log('Using microphone audio only');
+            newStreamInfo.streamType = 'mic-only';
+            setAudioStreamInfo(newStreamInfo);
+            return micStream;
+        }
+
+        // Both streams are available - combine them with enhanced processing
+        try {
+            const audioContext = createAudioContext();
+            
+            // Resume audio context if suspended
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+            
+            // Create audio destination for combined output
+            const destination = audioContext.createMediaStreamDestination();
+            
+            // Connect microphone audio with gain control
+            if (micStream && micStream.getAudioTracks().length > 0) {
+                const micSource = audioContext.createMediaStreamSource(micStream);
+                const micGain = audioContext.createGain();
+                micGain.gain.value = options?.micGain || 1.0; // Configurable mic gain
+                
+                // Add mild compression for mic to even out levels
+                const micCompressor = audioContext.createDynamicsCompressor();
+                micCompressor.threshold.value = -24;
+                micCompressor.knee.value = 30;
+                micCompressor.ratio.value = 12;
+                micCompressor.attack.value = 0.003;
+                micCompressor.release.value = 0.25;
+                
+                micSource.connect(micCompressor);
+                micCompressor.connect(micGain);
+                micGain.connect(destination);
+                console.log('Connected microphone audio with compression and gain control');
+            }
+            
+            // Connect system audio with gain control
+            if (systemStream && systemStream.getAudioTracks().length > 0) {
+                const systemSource = audioContext.createMediaStreamSource(systemStream);
+                const systemGain = audioContext.createGain();
+                systemGain.gain.value = options?.systemGain || 1.2; // Boost system audio slightly
+                
+                systemSource.connect(systemGain);
+                systemGain.connect(destination);
+                console.log('Connected system audio with gain boost');
+            }
+            
+            newStreamInfo.streamType = 'combined';
+            newStreamInfo.quality = 'high';
+            setAudioStreamInfo(newStreamInfo);
+            
+            return destination.stream;
+            
+        } catch (error) {
+            console.error('Error combining audio streams with enhanced processing:', error);
+            // Fallback to microphone if combination fails
+            console.log('Falling back to microphone audio only');
+            newStreamInfo.streamType = 'mic-only';
+            setAudioStreamInfo(newStreamInfo);
+            return micStream!;
+        }
+    }, [createAudioContext]);
+
+    // Clean up enhanced audio resources
+    const cleanupAudioResources = useCallback(() => {
+        console.log('Cleaning up enhanced audio resources');
+        
+        // Stop all stream references
+        [micStreamRef, systemStreamRef, combinedStreamRef, streamRef].forEach(ref => {
+            if (ref.current) {
+                ref.current.getTracks().forEach(track => {
+                    track.stop();
+                    track.enabled = false;
+                });
+                ref.current = null;
+            }
+        });
+        
+        // Close audio context
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+            audioContextRef.current.close().catch(console.error);
+            audioContextRef.current = null;
+        }
+        
+        // Reset audio stream info
+        setAudioStreamInfo({
+            hasSystemAudio: false,
+            hasMicAudio: false,
+            streamType: 'combined',
+            quality: 'medium'
+        });
+    }, []);
 
     // Clean up audio resources when component unmounts
     useEffect(() => {
@@ -152,19 +362,9 @@ export function useTranscriber(): Transcriber {
             if (webSocketRef.current) {
                 webSocketRef.current.close();
             }
+            cleanupAudioResources();
         };
-    }, []);
-
-    // Audio context and media recorder for live whisper transcription
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const micStreamRef = useRef<MediaStream | null>(null);
-    const streamingCallbackRef = useRef<((text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void) | null>(null);
-    
-    // Media recorder for audio/screen recording
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-    const streamRef = useRef<MediaStream | null>(null);
-    const audioChunksRef = useRef<Blob[]>([]);
-    const [error, setError] = useState<string>('');
+    }, [cleanupAudioResources]);
 
     const webWorker = useWorker((event) => {
         const message = event.data;
@@ -250,7 +450,7 @@ export function useTranscriber(): Transcriber {
     const postRequest = useCallback(
         async (audioData: AudioBuffer | undefined) => {
             if (audioData) {
-                console.log('Starting audio transcription process');
+                console.log('Starting enhanced audio transcription process');
                 console.log('Audio details:', {
                     sampleRate: audioData.sampleRate,
                     numberOfChannels: audioData.numberOfChannels,
@@ -263,7 +463,7 @@ export function useTranscriber(): Transcriber {
 
                 let audio;
                 if (audioData.numberOfChannels === 2) {
-                    console.log('Processing stereo audio to mono');
+                    console.log('Processing stereo audio to mono with enhanced quality');
                     const SCALING_FACTOR = Math.sqrt(2);
 
                     let left = audioData.getChannelData(0);
@@ -278,12 +478,13 @@ export function useTranscriber(): Transcriber {
                     audio = audioData.getChannelData(0);
                 }
 
-                console.log('Sending audio to worker with config:', {
+                console.log('Sending audio to worker with enhanced config:', {
                     model,
                     multilingual,
                     quantized,
                     subtask: multilingual ? subtask : null,
-                    language: multilingual && language !== "auto" ? language : null
+                    language: multilingual && language !== "auto" ? language : null,
+                    audioStreamInfo
                 });
 
                 webWorker.postMessage({
@@ -299,29 +500,32 @@ export function useTranscriber(): Transcriber {
                 console.warn('No audio data provided for transcription');
             }
         },
-        [webWorker, model, multilingual, quantized, subtask, language],
+        [webWorker, model, multilingual, quantized, subtask, language, audioStreamInfo],
     );
 
-    // File transcription function
+    // Enhanced file transcription function
     const transcribeFile = useCallback(async (file: File): Promise<TranscriptionResult> => {
       setIsBusy(true);
-      setTranscript({ text: '', chunks: [], isBusy: true }); // Reset transcript and indicate busy
+      setTranscript({ text: '', chunks: [], isBusy: true });
       try {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('engine', engine); // Use the current engine state
+        formData.append('engine', engine);
         
         const endpoint = 'http://localhost:8000/transcribe'; 
         
-        console.log(`Transcribing file with ${engine} engine: ${file.name}`);
+        console.log(`Enhanced transcribing file with ${engine} engine: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
         
         const response = await axios.post(endpoint, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 300000, // 5 minute timeout for large files
         });
         
         if (response.data && response.data.transcript !== undefined) {
           const transcriptText = response.data.transcript || '';
           const responseChunks = response.data.chunks || [];
+          
+          console.log(`Transcription completed: ${transcriptText.length} chars, ${responseChunks.length} segments`);
           
           setTranscript({
             isBusy: false,
@@ -350,13 +554,17 @@ export function useTranscriber(): Transcriber {
       }
     }, [engine, setTranscript]);
 
-    // Live streaming functionality - FIXED VERSION
-    const startStreaming = useCallback(async (updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, options?: {
-        captureBothIO?: boolean;
-        inputDevice?: string | number | null;
-        outputDevice?: string | number | null;
-    }) => {
-        console.log('Starting streaming transcription with engine:', engine);
+    // Enhanced live streaming functionality
+    const startStreaming = useCallback(async (
+        updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, 
+        options?: {
+            captureBothIO?: boolean;
+            inputDevice?: string | number | null;
+            outputDevice?: string | number | null;
+            preferSystemAudio?: boolean;
+        }
+    ) => {
+        console.log('Starting enhanced streaming transcription with engine:', engine, 'options:', options);
         
         if (isBusy || isStreamingRef.current) {
             console.log('Transcriber is busy or already streaming, cannot start streaming');
@@ -380,13 +588,24 @@ export function useTranscriber(): Transcriber {
         }
         
         try {
-            // Create a new WebSocket connection
-            const wsUrl = `ws://localhost:8000/transcriber/ws?engine=faster-whisper`;
+            // Create a new WebSocket connection with enhanced parameters
+            const wsUrl = `ws://localhost:8000/transcriber/ws?engine=faster-whisper&quality=high`;
             webSocketRef.current = new WebSocket(wsUrl);
             
             webSocketRef.current.onopen = () => {
-                console.log('WebSocket connection established');
+                console.log('Enhanced WebSocket connection established');
                 setIsBusy(false);
+                
+                // Send enhanced configuration
+                if (webSocketRef.current) {
+                    webSocketRef.current.send(JSON.stringify({
+                        engine: 'faster_whisper',
+                        model_name: 'base',
+                        language: 'en',
+                        enhance_audio: true,
+                        audio_stream_info: audioStreamInfo
+                    }));
+                }
             };
             
             webSocketRef.current.onmessage = (event) => {
@@ -404,10 +623,9 @@ export function useTranscriber(): Transcriber {
                         const segments = data.segments || [];
                         
                         // Update transcript state with the LATEST complete text
-                        // Don't accumulate - just show the current complete transcription
                         setTranscript(prev => ({
                             isBusy: true,
-                            text: data.text, // Use the complete text from the server
+                            text: data.text,
                             chunks: segments.map((seg: any) => ({
                                 text: seg.text,
                                 start: seg.start,
@@ -420,54 +638,53 @@ export function useTranscriber(): Transcriber {
                         streamingCallbackRef.current(data.text, segments);
                     }
                 } catch (error) {
-                    console.error('Error processing WebSocket message:', error);
+                    console.error('Error processing enhanced WebSocket message:', error);
                 }
             };
             
             webSocketRef.current.onerror = (error) => {
-                console.error('WebSocket error:', error);
+                console.error('Enhanced WebSocket error:', error);
                 setIsBusy(false);
                 isStreamingRef.current = false;
                 streamingCallbackRef.current = null;
             };
             
             webSocketRef.current.onclose = () => {
-                console.log('WebSocket connection closed');
+                console.log('Enhanced WebSocket connection closed');
                 setIsBusy(false);
                 isStreamingRef.current = false;
                 streamingCallbackRef.current = null;
                 webSocketRef.current = null;
             };
         } catch (error) {
-            console.error('Error setting up WebSocket:', error);
+            console.error('Error setting up enhanced WebSocket:', error);
             setIsBusy(false);
             isStreamingRef.current = false;
             streamingCallbackRef.current = null;
             return;
         }
-    }, [engine]);
+    }, [engine, audioStreamInfo]);
 
     const stopStreaming = useCallback(async () => {
-        console.log('Stopping streaming and cleaning up resources');
+        console.log('Stopping enhanced streaming and cleaning up resources');
         
         // Set streaming flag to false first to prevent processing new messages
         isStreamingRef.current = false;
         
         // Clear the streaming callback to prevent further updates
-        const currentCallback = streamingCallbackRef.current;
         streamingCallbackRef.current = null;
         
         // Close WebSocket connection if it exists
         if (webSocketRef.current) {
             const ws = webSocketRef.current;
-            webSocketRef.current = null; // Clear the reference first to prevent race conditions
+            webSocketRef.current = null;
             
             if (ws.readyState === WebSocket.OPEN) {
                 try {
-                    console.log('Closing WebSocket connection');
+                    console.log('Closing enhanced WebSocket connection');
                     ws.close();
                 } catch (error) {
-                    console.error('Error closing WebSocket:', error);
+                    console.error('Error closing enhanced WebSocket:', error);
                 }
             }
         }
@@ -475,36 +692,29 @@ export function useTranscriber(): Transcriber {
         // Stop any ongoing media recording
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
             try {
-                console.log('Stopping media recorder');
+                console.log('Stopping enhanced media recorder');
                 mediaRecorderRef.current.stop();
             } catch (error) {
-                console.error('Error stopping media recorder:', error);
+                console.error('Error stopping enhanced media recorder:', error);
             }
         }
         
-        // Stop all media tracks
-        if (streamRef.current) {
-            console.log('Stopping all media tracks');
-            streamRef.current.getTracks().forEach(track => {
-                track.stop();
-                track.enabled = false;
-            });
-            streamRef.current = null;
-        }
+        // Clean up all audio resources
+        cleanupAudioResources();
         
         // Reset audio chunks array
         audioChunksRef.current = [];
         
         // Stop server-side transcription
         try {
-            console.log('Sending stop request to server');
+            console.log('Sending enhanced stop request to server');
             await axios.post('http://localhost:8000/transcriber/stop');
-            console.log('Server transcription stopped');
+            console.log('Enhanced server transcription stopped');
         } catch (error) {
-            console.error('Error stopping server transcription:', error);
+            console.error('Error stopping enhanced server transcription:', error);
         }
         
-        // Finalize the transcript (mark as not busy)
+        // Finalize the transcript
         setTranscript(prev => prev ? {
             ...prev,
             isBusy: false
@@ -514,20 +724,41 @@ export function useTranscriber(): Transcriber {
         setIsRecording(false);
         setIsBusy(false);
         
-        console.log('Streaming and transcription fully stopped');
-    }, []);
+        console.log('Enhanced streaming and transcription fully stopped');
+    }, [cleanupAudioResources]);
     
-    // Recording functions - FIXED VERSION
-    const startRecording = useCallback(async () => {
+    // Enhanced recording functions
+    const startRecording = useCallback(async (options?: { captureSystemAudio?: boolean }) => {
         try {
             setIsBusy(true);
+            console.log('Starting enhanced recording with options:', options);
             
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const mediaRecorder = new MediaRecorder(stream);
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    sampleRate: 44100,
+                    channelCount: 1
+                }
+            });
+            
+            const mediaRecorder = new MediaRecorder(stream, {
+                mimeType: 'audio/webm;codecs=opus',
+                audioBitsPerSecond: 128000
+            });
             
             // Store references for cleanup
             mediaRecorderRef.current = mediaRecorder;
             streamRef.current = stream;
+            micStreamRef.current = stream;
+            
+            // Update audio stream info
+            setAudioStreamInfo(prev => ({
+                ...prev,
+                hasMicAudio: true,
+                streamType: 'mic-only'
+            }));
             
             // Reset audio chunks
             audioChunksRef.current = [];
@@ -535,37 +766,35 @@ export function useTranscriber(): Transcriber {
             mediaRecorder.ondataavailable = (event) => {
                 if (event.data.size > 0) {
                     audioChunksRef.current.push(event.data);
-                    console.log(`Recorded audio chunk: ${event.data.size} bytes`);
+                    console.log(`Enhanced recorded audio chunk: ${event.data.size} bytes`);
                 }
             };
             
             mediaRecorder.onstop = async () => {
                 const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-                const audioFile = new File([audioBlob], `recording-${Date.now()}.webm`, { type: 'audio/webm' });
+                const audioFile = new File([audioBlob], `enhanced-recording-${Date.now()}.webm`, { type: 'audio/webm' });
                 
                 // Create a preview URL
                 const url = URL.createObjectURL(audioBlob);
                 setRecordedMedia({ url, type: 'audio' });
                 
-                console.log('Recording stopped, transcribing file');
+                console.log('Enhanced recording stopped, transcribing file');
                 await transcribeFile(audioFile);
             };
             
-            // Start recording - collect data every second
+            // Start recording
             mediaRecorder.start(1000);
             setIsRecording(true);
-            console.log('Audio recording started');
+            console.log('Enhanced audio recording started');
             
             // If live mode is enabled, start streaming
             if (isLiveMode) {
-                console.log('Live mode enabled, starting streaming transcription');
+                console.log('Live mode enabled, starting enhanced streaming transcription');
                 startStreaming((text, segments) => {
-                    // Only update if we're still recording and streaming is active
                     if (isRecording && isStreamingRef.current) {
-                        // Don't accumulate text in live mode - just show current transcription
                         setTranscript(prev => ({
                             isBusy: true,
-                            text: text, // Show current text only
+                            text: text,
                             chunks: segments ? segments.map(seg => ({
                                 text: seg.text,
                                 start: seg.start,
@@ -577,7 +806,7 @@ export function useTranscriber(): Transcriber {
                 });
             }
         } catch (error) {
-            console.error('Error starting recording:', error);
+            console.error('Error starting enhanced recording:', error);
         } finally {
             setIsBusy(false);
         }
@@ -586,12 +815,12 @@ export function useTranscriber(): Transcriber {
     const stopRecording = useCallback(async () => {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
             try {
-                console.log('Stopping media recorder and cleaning up');
+                console.log('Stopping enhanced media recorder and cleaning up');
                 const recorder = mediaRecorderRef.current;
                 
                 // Stop streaming first if live mode was enabled
                 if (isLiveMode && isStreamingRef.current) {
-                    console.log('Stopping live streaming');
+                    console.log('Stopping enhanced live streaming');
                     await stopStreaming();
                 }
                 
@@ -599,19 +828,11 @@ export function useTranscriber(): Transcriber {
                 return new Promise<void>((resolve) => {
                     const onStop = () => {
                         recorder.removeEventListener('stop', onStop);
-                        console.log('Media recorder stopped');
+                        console.log('Enhanced media recorder stopped');
                         
-                        // Stop all tracks in the stream
-                        if (streamRef.current) {
-                            streamRef.current.getTracks().forEach(track => {
-                                track.stop();
-                                track.enabled = false;
-                            });
-                            streamRef.current = null;
-                        }
-                        
+                        cleanupAudioResources();
                         setIsRecording(false);
-                        console.log('Recording stopped');
+                        console.log('Enhanced recording stopped');
                         resolve();
                     };
                     
@@ -619,174 +840,31 @@ export function useTranscriber(): Transcriber {
                     recorder.stop();
                 });
             } catch (error) {
-                console.error('Error stopping recording:', error);
+                console.error('Error stopping enhanced recording:', error);
                 setIsRecording(false);
                 return Promise.resolve();
             }
         } else {
-            console.log('No active recording to stop');
+            console.log('No active enhanced recording to stop');
             return Promise.resolve();
         }
-    }, [isLiveMode, stopStreaming]);
+    }, [isLiveMode, stopStreaming, cleanupAudioResources]);
     
-    // Screen recording functions
-    const startScreenRecording = useCallback(async () => {
-        try {
-            setIsBusy(true);
-            console.log('Starting screen recording, live mode:', isLiveMode);
-            
-            // Display a message to the user about enabling system audio
-            console.info('IMPORTANT: When sharing your screen, please select "Share system audio" option if available');
-            
-            // Request screen sharing with audio (this will capture system OUTPUT audio on supported browsers)
-            // First request system audio specifically with the displayMedia
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({
-                video: { 
-                    frameRate: { ideal: 30 },
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 } 
-                },
-                audio: {
-                    // Explicitly request system audio capture
-                    // This ensures we're trying to get system audio, not just any audio
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false
-                } 
-            });
-
-            // Check if we actually got any system audio tracks
-            let combinedStream = screenStream;
-            const hasScreenAudio = screenStream.getAudioTracks().length > 0;
-            
-            if (hasScreenAudio) {
-                console.log('Successfully captured system audio', screenStream.getAudioTracks());
-            } else {
-                console.warn('No system audio tracks captured. The browser might not support system audio capture.');
-            }
-            
-            try {
-                // Get microphone audio separately
-                console.log('Adding microphone audio to capture voice input');
-                const micAudioStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false
-                    }
-                });
-                
-                // Create a new stream with all tracks
-                const allTracks = [
-                    ...screenStream.getVideoTracks()
-                ];
-                
-                // Add microphone audio
-                if (micAudioStream.getAudioTracks().length > 0) {
-                    allTracks.push(...micAudioStream.getAudioTracks());
-                    console.log('Added microphone audio track');
-                }
-                
-                // Add screen audio track if it exists (system audio)
-                if (hasScreenAudio) {
-                    allTracks.push(...screenStream.getAudioTracks());
-                    console.log('Combined both system audio and microphone audio');
-                } else {
-                    console.log('No system audio detected, using microphone audio only');
-                    
-                    // Show a warning to the user that system audio isn't being captured
-                    alert('System audio capture is not available. Only microphone audio will be recorded. Please make sure you have enabled "Share system audio" in the browser sharing dialog.');
-                }
-                
-                combinedStream = new MediaStream(allTracks);
-            } catch (audioErr) {
-                console.warn('Could not get microphone audio:', audioErr);
-                // Continue with just screen audio if available
-                if (hasScreenAudio) {
-                    console.log('Continuing with only system output audio');
-                } else {
-                    console.warn('No audio tracks available for recording');
-                    alert('No audio tracks available for recording. Please ensure you have allowed audio access.');
-                }
-            }
-            
-            // Create a MediaRecorder for the screen + audio
-            const mediaRecorder = new MediaRecorder(combinedStream, {
-                mimeType: 'video/webm'
-            });
-            
-            // Reset the chunks array
-            audioChunksRef.current = [];
-            
-            // Store references for cleanup
-            mediaRecorderRef.current = mediaRecorder;
-            streamRef.current = combinedStream;
-            
-            // Set up event handlers
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) {
-                    audioChunksRef.current.push(e.data);
-                    console.log(`Recorded chunk: ${e.data.size} bytes`);
-                }
-            };
-            
-            mediaRecorder.onstop = async () => {
-                console.log('Screen recording stopped');
-                // Create a blob from recorded chunks
-                const blob = new Blob(audioChunksRef.current, { type: 'video/webm' });
-                console.log(`Created blob: ${blob.size} bytes`);
-                
-                const file = new File([blob], `screen-recording-${Date.now()}.webm`, { type: 'video/webm' });
-                
-                // Create object URL for preview
-                const url = URL.createObjectURL(blob);
-                setRecordedMedia({ url, type: 'video' });
-                
-                // Transcribe the recording
-                await transcribeFile(file);
-            };
-            
-            // Start recording
-            mediaRecorder.start(1000); // Collect data every second
-            setIsRecording(true);
-            console.log('MediaRecorder started');
-            
-            // For live mode, set up streaming
-            if (isLiveMode) {
-                console.log('Live mode enabled, starting streaming');
-                startStreaming((text) => {
-                    if (isStreamingRef.current) {
-                        setTranscript(prev => ({
-                            isBusy: true,
-                            text: text, // Show current text, don't accumulate
-                            chunks: [],
-                        }));
-                    }
-                });
-            }
-        } catch (error) {
-            console.error('Error starting screen recording:', error);
-        } finally {
-            setIsBusy(false);
-        }
-    }, [isLiveMode, startStreaming, transcribeFile]);
+    // Enhanced screen recording functions (interface only - actual implementation in App.tsx)
+    const startScreenRecording = useCallback(async (options?: { 
+        preferSystemAudio?: boolean;
+        combineWithMic?: boolean;
+        quality?: 'low' | 'medium' | 'high';
+    }) => {
+        console.log('Enhanced screen recording interface ready with options:', options);
+        // Implementation handled in App.tsx for better access to state management
+    }, []);
 
     const stopScreenRecording = useCallback(() => {
-        if (mediaRecorderRef.current) {
-            mediaRecorderRef.current.stop();
-            if (streamRef.current) {
-                streamRef.current.getTracks().forEach(track => track.stop());
-            }
-        }
-        
-        // Stop streaming if live mode was enabled
-        if (isLiveMode) {
-            stopStreaming();
-        }
-        
+        console.log('Enhanced screen recording stop interface called');
+        cleanupAudioResources();
         setIsRecording(false);
-        console.log('Recording stopped');
-    }, [isLiveMode, stopStreaming]);
+    }, [cleanupAudioResources]);
 
     const transcriber = useMemo((): Transcriber => {
         return {
@@ -803,6 +881,7 @@ export function useTranscriber(): Transcriber {
             isLiveMode,
             setIsLiveMode,
             recordedMedia,
+            audioStreamInfo, // Enhanced audio info
             transcribeFile,
             startStreaming,
             stopStreaming,
@@ -830,6 +909,7 @@ export function useTranscriber(): Transcriber {
         isRecording,
         isLiveMode,
         recordedMedia,
+        audioStreamInfo, // Enhanced audio info
         transcribeFile,
         startStreaming,
         stopStreaming,

@@ -92,11 +92,21 @@ function App() {
   const screenAudioChunksRef = useRef<Blob[]>([]);
   const [uploadedAudioFile, setUploadedAudioFile] = useState<File | null>(null);
   
+  // Enhanced audio capture states
+  const [systemAudioAvailable, setSystemAudioAvailable] = useState<boolean>(false);
+  const [audioStreamType, setAudioStreamType] = useState<'mic-only' | 'system-only' | 'combined'>('combined');
+  
   // Improved WebSocket management
   const webSocketRef = useRef<WebSocket | null>(null);
   const webSocketSessionId = useRef<string | null>(null);
   const isLiveTranscriptionActive = useRef<boolean>(false);
   const processedSegmentIds = useRef<Set<string>>(new Set());
+
+  // Enhanced audio context for better audio processing
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const systemStreamRef = useRef<MediaStream | null>(null);
+  const combinedStreamRef = useRef<MediaStream | null>(null);
 
   // Summary Generation - now uses direct response from Ollama API
   const generateSummaryFromAPI = async (transcript: string) => {
@@ -307,8 +317,97 @@ function App() {
     return text;
   };
   
-  const audioPlayerRef = useRef<HTMLAudioElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  // Audio resampling utility function
+  const resampleAudio = useCallback((audioData: Float32Array, fromSampleRate: number, toSampleRate: number): Float32Array => {
+    if (fromSampleRate === toSampleRate) {
+      return audioData;
+    }
+
+    const ratio = fromSampleRate / toSampleRate;
+    const newLength = Math.round(audioData.length / ratio);
+    const result = new Float32Array(newLength);
+
+    for (let i = 0; i < newLength; i++) {
+      const srcIndex = i * ratio;
+      const srcIndexFloor = Math.floor(srcIndex);
+      const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
+      const fraction = srcIndex - srcIndexFloor;
+      
+      result[i] = audioData[srcIndexFloor] * (1 - fraction) + audioData[srcIndexCeil] * fraction;
+    }
+
+    return result;
+  }, []);
+
+  // Audio context utility function
+  const createAudioContext = useCallback(() => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    return audioContextRef.current;
+  }, []);
+
+  const combineAudioStreams = useCallback(async (micStream: MediaStream | null, systemStream: MediaStream | null): Promise<MediaStream> => {
+    console.log('Combining audio streams:', { 
+      micTracks: micStream?.getAudioTracks().length || 0, 
+      systemTracks: systemStream?.getAudioTracks().length || 0 
+    });
+
+    if (!micStream && !systemStream) {
+      throw new Error('No audio streams available to combine');
+    }
+
+    // If only one stream is available, return it directly
+    if (!micStream && systemStream) {
+      console.log('Using system audio only');
+      setAudioStreamType('system-only');
+      return systemStream;
+    }
+    
+    if (micStream && !systemStream) {
+      console.log('Using microphone audio only');
+      setAudioStreamType('mic-only');
+      return micStream;
+    }
+
+    // Both streams are available - combine them
+    try {
+      const audioContext = createAudioContext();
+      
+      // Create audio destination for combined output
+      const destination = audioContext.createMediaStreamDestination();
+      
+      // Connect microphone audio
+      if (micStream && micStream.getAudioTracks().length > 0) {
+        const micSource = audioContext.createMediaStreamSource(micStream);
+        const micGain = audioContext.createGain();
+        micGain.gain.value = 1.0; // Full volume for mic
+        micSource.connect(micGain);
+        micGain.connect(destination);
+        console.log('Connected microphone audio to combined stream');
+      }
+      
+      // Connect system audio
+      if (systemStream && systemStream.getAudioTracks().length > 0) {
+        const systemSource = audioContext.createMediaStreamSource(systemStream);
+        const systemGain = audioContext.createGain();
+        systemGain.gain.value = 1.2; // Boost system audio slightly as it's often quieter
+        systemSource.connect(systemGain);
+        systemGain.connect(destination);
+        console.log('Connected system audio to combined stream');
+      }
+      
+      setAudioStreamType('combined');
+      return destination.stream;
+      
+    } catch (error) {
+      console.error('Error combining audio streams:', error);
+      // Fallback to microphone if combination fails
+      console.log('Falling back to microphone audio only');
+      setAudioStreamType('mic-only');
+      return micStream!;
+    }
+  }, [createAudioContext]);
 
   // Improved WebSocket connection management
   const initializeWebSocketConnection = useCallback(() => {
@@ -457,12 +556,38 @@ function App() {
     console.log('WebSocket cleanup completed');
   }, []);
 
+  // Cleanup audio streams function
+  const cleanupAudioStreams = useCallback(() => {
+    console.log('Cleaning up audio streams and context');
+    
+    // Stop all stream tracks
+    [micStreamRef, systemStreamRef, combinedStreamRef, streamRef].forEach(streamRef => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          track.stop();
+          track.enabled = false;
+        });
+        streamRef.current = null;
+      }
+    });
+    
+    // Close audio context
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(console.error);
+      audioContextRef.current = null;
+    }
+    
+    setSystemAudioAvailable(false);
+    setAudioStreamType('combined');
+  }, []);
+
   // Effect to cleanup WebSocket on component unmount
   useEffect(() => {
     return () => {
       cleanupWebSocket();
+      cleanupAudioStreams();
     };
-  }, [cleanupWebSocket]);
+  }, [cleanupWebSocket, cleanupAudioStreams]);
 
   const startAudioRecording = (withLiveTranscript: boolean): void => {
     if (isRecording) {
@@ -654,13 +779,14 @@ function App() {
     }
   };
 
+  // Enhanced screen recording with proper live audio streaming
   const startScreenRecording = async (withLiveTranscript: boolean) => {
     if (isScreenRecording) {
       console.log('Already screen recording.');
       return;
     }
     
-    console.log(`Starting screen recording with live transcript: ${withLiveTranscript}`);
+    console.log(`Starting enhanced screen recording with live transcript: ${withLiveTranscript}`);
     setIsScreenRecording(true);
     setError('');
     
@@ -669,74 +795,167 @@ function App() {
     setLiveSegments([]);
     setLiveTranscript('');
     processedSegmentIds.current.clear();
+    cleanupAudioStreams(); // Clean up any existing streams
     
     setIsLiveMode(withLiveTranscript);
 
-    // Initialize WebSocket for live transcription if needed
-    if (withLiveTranscript) {
-      console.log('Starting live transcription WebSocket for screen recording');
-      initializeWebSocketConnection();
-    }
-
     try {
-      // Request screen capture with audio
+      console.log('Step 1: Requesting screen share with system audio...');
+      
+      // Step 1: Request screen sharing with explicit system audio request
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: { 
-          displaySurface: 'monitor', 
-          frameRate: { ideal: 30 }, 
-          width: { ideal: 1920 }, 
-          height: { ideal: 1080 } 
+          displaySurface: 'monitor',
+          frameRate: { ideal: 30 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         },
         audio: {
+          // Request system audio explicitly
           echoCancellation: false,
           noiseSuppression: false,
-          autoGainControl: false
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false, // Allow capturing played audio
         }
       });
 
-      // Check if we got system audio tracks
-      const hasScreenAudio = displayStream.getAudioTracks().length > 0;
-      if (hasScreenAudio) {
-        console.log('Successfully captured system audio tracks:', displayStream.getAudioTracks());
+      // Check what audio tracks we got from screen sharing
+      const systemAudioTracks = displayStream.getAudioTracks();
+      console.log(`Screen share returned ${systemAudioTracks.length} audio tracks:`, 
+        systemAudioTracks.map(track => ({ 
+          label: track.label,
+          kind: track.kind,
+          enabled: track.enabled
+        }))
+      );
+
+      if (systemAudioTracks.length > 0) {
+        console.log('✅ System audio captured successfully!');
+        setSystemAudioAvailable(true);
+        systemStreamRef.current = new MediaStream(systemAudioTracks);
       } else {
-        console.warn('No system audio tracks captured. Make sure to enable "Share system audio"');
-        alert('Please make sure you enable "Share system audio" in the browser dialog to capture system sounds.');
-      }
-
-      // Get microphone audio separately
-      const audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: { 
-          echoCancellation: false, 
-          noiseSuppression: false, 
-          autoGainControl: false 
+        console.warn('❌ No system audio tracks captured from screen share');
+        setSystemAudioAvailable(false);
+        
+        // Show user instruction for better system audio capture
+        const userAgent = navigator.userAgent.toLowerCase();
+        let instruction = '';
+        
+        if (userAgent.includes('chrome')) {
+          instruction = 'In Chrome: Make sure to check "Share system audio" when selecting screen/tab to share.';
+        } else if (userAgent.includes('firefox')) {
+          instruction = 'In Firefox: System audio capture may not be available. Try using Chrome for better system audio support.';
+        } else if (userAgent.includes('safari')) {
+          instruction = 'In Safari: System audio capture is not supported. Try using Chrome or Firefox.';
+        } else {
+          instruction = 'Make sure to enable "Share system audio" option when sharing your screen/tab.';
         }
-      });
-
-      // Create a combined stream with all tracks
-      const combinedStream = new MediaStream();
-      // Add video tracks first
-      displayStream.getVideoTracks().forEach(track => combinedStream.addTrack(track));
-      // Add microphone audio
-      audioStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
-      // Add system audio if available
-      if (hasScreenAudio) {
-        displayStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
+        
+        console.warn(`System audio not available. ${instruction}`);
+        alert(`System audio not detected!\n\n${instruction}\n\nWe'll continue with microphone audio only.`);
       }
 
-      console.log('Combined stream created. Video:', combinedStream.getVideoTracks().length, 'Audio:', combinedStream.getAudioTracks().length);
+      console.log('Step 2: Requesting microphone access...');
+      
+      // Step 2: Get microphone audio separately with optimized settings
+      let micStream: MediaStream | null = null;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false, // Disable to get raw audio
+            noiseSuppression: false, // Disable to preserve system audio
+            autoGainControl: false,  // Disable to maintain levels
+            sampleRate: 44100,       // High quality sample rate
+            channelCount: 1,         // Mono is sufficient for speech
+          }
+        });
+        
+        console.log(`✅ Microphone access granted: ${micStream.getAudioTracks().length} tracks`);
+        micStreamRef.current = micStream;
+      } catch (micError) {
+        console.warn('⚠️ Could not access microphone:', micError);
+        alert('Could not access microphone. Continuing with system audio only (if available).');
+      }
 
+      console.log('Step 3: Combining audio streams...');
+      
+      // Step 3: Combine all available audio streams
+      const finalAudioStream = await combineAudioStreams(micStream, systemStreamRef.current);
+      
+      console.log('Step 4: Creating combined media stream...');
+      
+      // Step 4: Create final combined stream with video + combined audio
+      const finalCombinedStream = new MediaStream();
+      
+      // Add video tracks from display stream
+      displayStream.getVideoTracks().forEach(track => {
+        finalCombinedStream.addTrack(track);
+        console.log(`Added video track: ${track.label}`);
+      });
+      
+      // Add combined audio tracks
+      finalAudioStream.getAudioTracks().forEach(track => {
+        finalCombinedStream.addTrack(track);
+        console.log(`Added combined audio track: ${track.label || 'Combined Audio'}`);
+      });
+      
+      combinedStreamRef.current = finalCombinedStream;
+
+      console.log(`Final stream created with ${finalCombinedStream.getVideoTracks().length} video tracks and ${finalCombinedStream.getAudioTracks().length} audio tracks`);
+
+      // Step 5: Initialize WebSocket for live transcription BEFORE starting recording
+      if (withLiveTranscript) {
+        console.log('Step 5a: Starting live transcription WebSocket for screen recording');
+        initializeWebSocketConnection();
+        
+        // Step 5b: Set up audio processing for live transcription
+        await setupLiveAudioProcessing(finalAudioStream);
+      }
+
+      console.log('Step 6: Setting up MediaRecorder...');
+      
+      // Step 6: Set up MediaRecorder with optimal settings
       const recorderOptions = {
         mimeType: 'video/webm;codecs=vp9,opus',
-        videoBitsPerSecond: 3000000, // 3 Mbps for video
-        audioBitsPerSecond: 128000,  // 128 kbps for audio
+        videoBitsPerSecond: 2500000, // 2.5 Mbps for good quality
+        audioBitsPerSecond: 128000,  // 128 kbps for clear audio
       };
       
-      const screenRecorder = new MediaRecorder(combinedStream, recorderOptions);
+      // Fallback options if the preferred format isn't supported
+      const fallbackOptions = [
+        { mimeType: 'video/webm;codecs=vp8,opus' },
+        { mimeType: 'video/webm' },
+        { mimeType: 'video/mp4' }
+      ];
+      
+      let screenRecorder: MediaRecorder;
+      try {
+        screenRecorder = new MediaRecorder(finalCombinedStream, recorderOptions);
+      } catch (e) {
+        console.warn('Primary recorder options failed, trying fallbacks:', e);
+        
+        for (const options of fallbackOptions) {
+          try {
+            screenRecorder = new MediaRecorder(finalCombinedStream, options);
+            console.log(`Using fallback recorder with: ${options.mimeType}`);
+            break;
+          } catch (fallbackError) {
+            console.warn(`Fallback ${options.mimeType} failed:`, fallbackError);
+          }
+        }
+        
+        if (!screenRecorder!) {
+          throw new Error('No supported MediaRecorder format found');
+        }
+      }
+      
       screenMediaRecorderRef.current = screenRecorder;
 
+      // Set up recorder event handlers
       screenRecorder.ondataavailable = (event: BlobEvent) => {
         if (event.data.size > 0) {
           screenAudioChunksRef.current.push(event.data);
+          console.log(`Recorded chunk: ${event.data.size} bytes`);
         }
       };
 
@@ -744,45 +963,62 @@ function App() {
         console.log('Screen recorder stopped.');
         setIsScreenRecording(false);
         
-        const videoBlob = new Blob(screenAudioChunksRef.current, { type: 'video/webm' });
+        const videoBlob = new Blob(screenAudioChunksRef.current, { 
+          type: screenRecorder.mimeType || 'video/webm' 
+        });
         
         if (videoBlob.size > 0) {
-          const videoFile = new File([videoBlob], `screen_recording_${Date.now()}.webm`, { type: videoBlob.type });
-          console.log('Screen recording finished, blob size:', videoBlob.size);
+          console.log(`Recording completed - Size: ${(videoBlob.size / 1024 / 1024).toFixed(2)} MB`);
           
-          // Create and save the audio URL for playback
+          // Create preview URL
           const url = URL.createObjectURL(videoBlob);
           setAudioUrl(url);
           
-          // If this was a live transcript, move to transcript step
+          // If this was live mode and we have segments, move to next step
           if (withLiveTranscript && liveSegments.length > 0) {
-            console.log('Transferring live segments to transcript', liveSegments);
-            setCurrentStep(2);
-          }
-          
-          // If not live mode, transcribe the file
-          if (!withLiveTranscript) {
+            console.log('Live recording finished with segments:', liveSegments.length);
+            setCurrentStep(3);
+          } else {
+            // For non-live mode, transcribe the recorded file
             try {
+              console.log('Starting transcription of recorded file...');
               setIsTranscribing(true);
+              
+              const videoFile = new File([videoBlob], `screen_recording_${Date.now()}.webm`, { 
+                type: videoBlob.type 
+              });
+              
               const result = await transcriber.transcribeFile(videoFile);
-              setIsTranscribing(false);
               console.log('Transcription completed:', result);
-              setCurrentStep(2);
+              
+              if (result.transcript) {
+                setLiveTranscript(result.transcript);
+                if (result.chunks) {
+                  const processedSegments = result.chunks.map((chunk: any, index: number) => ({
+                    text: chunk.text || '',
+                    start: chunk.start || 0,
+                    end: chunk.end || 0,
+                    timestamp: [chunk.start || 0, chunk.end || 0] as [number, number | null],
+                    id: `segment_${index}_${chunk.start || 0}`
+                  }));
+                  setLiveSegments(processedSegments);
+                }
+                setCurrentStep(3);
+              }
             } catch (error) {
               console.error('Transcription error:', error);
+              setError(`Failed to transcribe recording: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            } finally {
               setIsTranscribing(false);
-              setError('Failed to transcribe recording: ' + (error instanceof Error ? error.message : String(error)));
             }
           }
         } else {
           console.warn('No data recorded - blob size is 0');
-          setError('Recording failed: No audio data captured');
+          setError('Recording failed: No data captured');
         }
         
-        // Stop all tracks in the streams
-        combinedStream.getTracks().forEach(track => track.stop());
-        displayStream.getTracks().forEach(track => track.stop());
-        audioStream.getTracks().forEach(track => track.stop());
+        // Cleanup all streams
+        cleanupAudioStreams();
         
         // Cleanup live transcription if it was active
         if (withLiveTranscript) {
@@ -790,22 +1026,189 @@ function App() {
         }
       };
 
-      // Start the screen recorder
-      screenRecorder.start(1000); // Collect data every second
-      console.log('Screen MediaRecorder started');
+      console.log('Step 7: Starting recording...');
+      
+      // Step 7: Start recording
+      try {
+        screenRecorder.start(1000); // Collect data every second
+        console.log('✅ Screen recording started successfully!');
+        
+        // Show recording status with audio source info
+        const audioInfo = systemAudioAvailable 
+          ? (micStream ? 'System + Microphone Audio' : 'System Audio Only')
+          : 'Microphone Audio Only';
+        
+        console.log(`🎙️ Audio capture mode: ${audioInfo}`);
+        
+      } catch (startError) {
+        console.error('Failed to start screen recorder:', startError);
+        throw startError;
+      }
       
     } catch (err) {
-      console.error('Error starting screen recording:', err);
-      setError('Failed to start screen recording. Check permissions.');
+      console.error('Error in enhanced screen recording:', err);
+      let errorMessage = 'Failed to start screen recording. ';
+      
+      if (err instanceof Error) {
+        if (err.message.includes('Permission denied')) {
+          errorMessage += 'Permission denied. Please allow screen sharing and try again.';
+        } else if (err.message.includes('NotAllowedError')) {
+          errorMessage += 'Screen sharing was cancelled or not allowed.';
+        } else if (err.message.includes('NotSupportedError')) {
+          errorMessage += 'Screen recording is not supported in this browser.';
+        } else {
+          errorMessage += err.message;
+        }
+      } else {
+        errorMessage += 'Unknown error occurred.';
+      }
+      
+      setError(errorMessage);
       setIsScreenRecording(false);
       setIsLiveMode(false);
       
       // Cleanup on error
+      cleanupAudioStreams();
       if (withLiveTranscript) {
         cleanupWebSocket();
       }
     }
   };
+
+  // NEW: Send audio data to WebSocket for transcription
+  const sendAudioForTranscription = useCallback((audioChunks: Float32Array[], sampleRate: number) => {
+    if (!webSocketRef.current || webSocketRef.current.readyState !== WebSocket.OPEN) {
+      console.warn('WebSocket not ready for audio data');
+      return;
+    }
+
+    try {
+      // Combine all audio chunks
+      const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const combinedAudio = new Float32Array(totalLength);
+      
+      let offset = 0;
+      for (const chunk of audioChunks) {
+        combinedAudio.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      // Convert to 16kHz mono for Whisper (if needed)
+      let processedAudio = combinedAudio;
+      if (sampleRate !== 16000) {
+        processedAudio = resampleAudio(combinedAudio, sampleRate, 16000);
+      }
+
+      // Convert Float32Array to ArrayBuffer
+      const audioBuffer = new ArrayBuffer(processedAudio.length * 4);
+      const view = new Float32Array(audioBuffer);
+      view.set(processedAudio);
+
+      // Send audio data to WebSocket
+      const message = {
+        type: 'audio_data',
+        audio: Array.from(processedAudio), // Convert to regular array for JSON
+        sample_rate: 16000,
+        timestamp: Date.now()
+      };
+
+      webSocketRef.current.send(JSON.stringify(message));
+      console.log(`Sent ${processedAudio.length} audio samples for live transcription`);
+      
+    } catch (error) {
+      console.error('Error sending audio for transcription:', error);
+    }
+  }, []);
+
+  // NEW: Simple audio resampling function
+  const resampleAudio = useCallback((audioData: Float32Array, fromSampleRate: number, toSampleRate: number): Float32Array => {
+    if (fromSampleRate === toSampleRate) {
+      return audioData;
+    }
+
+    const ratio = fromSampleRate / toSampleRate;
+    const newLength = Math.round(audioData.length / ratio);
+    const result = new Float32Array(newLength);
+
+    for (let i = 0; i < newLength; i++) {
+      const srcIndex = i * ratio;
+      const srcIndexFloor = Math.floor(srcIndex);
+      const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
+      const fraction = srcIndex - srcIndexFloor;
+      
+      result[i] = audioData[srcIndexFloor] * (1 - fraction) + audioData[srcIndexCeil] * fraction;
+    }
+
+    return result;
+  }, []);
+
+  // NEW: Setup live audio processing for real-time transcription
+  const setupLiveAudioProcessing = useCallback(async (audioStream: MediaStream) => {
+    if (!audioStream || audioStream.getAudioTracks().length === 0) {
+      console.warn('No audio tracks available for live processing');
+      return;
+    }
+
+    try {
+      console.log('Setting up live audio processing for screen recording');
+      
+      // Create audio context for processing
+      const audioContext = createAudioContext();
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+
+      // Create analyser and processor nodes
+      const source = audioContext.createMediaStreamSource(audioStream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      
+      // Buffer to accumulate audio data
+      let audioBuffer: Float32Array[] = [];
+      let bufferDuration = 0;
+      const targetDuration = 3; // seconds
+      const sampleRate = audioContext.sampleRate;
+
+      processor.onaudioprocess = (event) => {
+        if (!isLiveTranscriptionActive.current || !isScreenRecording) {
+          return;
+        }
+
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0);
+        
+        // Only process if there's actual audio (not silence)
+        const audioLevel = Math.sqrt(inputData.reduce((sum, x) => sum + x * x, 0) / inputData.length);
+        
+        if (audioLevel > 0.001) { // Threshold to avoid processing silence
+          // Copy audio data to buffer
+          const chunk = new Float32Array(inputData.length);
+          chunk.set(inputData);
+          audioBuffer.push(chunk);
+          
+          bufferDuration += inputData.length / sampleRate;
+          
+          // When we have enough audio, send it for transcription
+          if (bufferDuration >= targetDuration) {
+            sendAudioForTranscription(audioBuffer, sampleRate);
+            audioBuffer = [];
+            bufferDuration = 0;
+          }
+        }
+      };
+
+      // Connect the audio processing chain
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      console.log('Live audio processing setup completed');
+      
+      // Store references for cleanup
+      audioContextRef.current = audioContext;
+      
+    } catch (error) {
+      console.error('Error setting up live audio processing:', error);
+    }
+  }, [createAudioContext, sendAudioForTranscription]);
 
   const stopScreenRecording = useCallback(() => {
     console.log('Stopping screen recording...');
@@ -822,12 +1225,15 @@ function App() {
       screenMediaRecorderRef.current = null;
     }
     
+    // Cleanup all audio streams
+    cleanupAudioStreams();
+    
     // Cleanup WebSocket connection
     cleanupWebSocket();
     
     setIsLiveMode(false);
     console.log('Screen recording cleanup completed');
-  }, [cleanupWebSocket]);
+  }, [cleanupWebSocket, cleanupAudioStreams]);
 
   const stopAudioRecording = (): void => {
     console.log('stopAudioRecording called. Current state:', mediaRecorderRef.current?.state);
@@ -954,7 +1360,7 @@ function App() {
           />
         </div>
 
-        {/* Audio Input Options */}
+        {/* Enhanced Audio Input Options */}
         <Card title="Input Options" icon={Icon('Mic')} fullWidth>
           <div className="space-y-4">
             {/* Live Mode Toggle */}
@@ -967,6 +1373,36 @@ function App() {
                 <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isLiveMode ? 'translate-x-6' : 'translate-x-1'}`} />
               </button>
             </div>
+
+            {/* Audio Capture Status Display */}
+            {(isRecording || isScreenRecording) && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
+                <div className="flex items-center mb-2">
+                  <div className="w-3 h-3 bg-blue-500 rounded-full mr-2 animate-pulse"></div>
+                  <span className="text-sm font-medium text-blue-800">
+                    Audio Capture Status
+                  </span>
+                </div>
+                <div className="text-xs text-blue-600 space-y-1">
+                  <div className="flex items-center">
+                    <span className="font-medium mr-2">Mode:</span>
+                    <span className="capitalize">{audioStreamType.replace('-', ' + ')}</span>
+                  </div>
+                  <div className="flex items-center">
+                    <span className="font-medium mr-2">System Audio:</span>
+                    <span className={systemAudioAvailable ? 'text-green-600' : 'text-orange-600'}>
+                      {systemAudioAvailable ? '✅ Captured' : '⚠️ Not Available'}
+                    </span>
+                  </div>
+                  <div className="flex items-center">
+                    <span className="font-medium mr-2">Live Transcription:</span>
+                    <span className={isLiveTranscriptionActive.current ? 'text-green-600' : 'text-red-600'}>
+                      {isLiveTranscriptionActive.current ? '✅ Active' : '❌ Inactive'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Recording options when nothing is recording */}
             {!isRecording && !isScreenRecording && (
@@ -990,6 +1426,12 @@ function App() {
                         setUploadedAudioFile(file);
                         setAudioUrl(URL.createObjectURL(file));
                         setRecordedBlob(null); // Clear any previous recording
+                        // Reset transcript data for new file
+                        setLiveSegments([]);
+                        setLiveTranscript('');
+                        transcriber.output = undefined;
+                        setActionItems([]);
+                        setSummary('');
                         setCurrentStep(2); // Show Generate Transcript button
                       }
                     }}
@@ -1009,7 +1451,7 @@ function App() {
                   <span className="text-xs text-gray-500 mt-1">{isLiveMode ? 'With Live Transcript' : 'Standard'}</span>
                 </button>
 
-                {/* Screen Recording Button */}
+                {/* Enhanced Screen Recording Button */}
                 <button
                   className="flex flex-col items-center justify-center p-6 border-2 border-gray-200 rounded-xl hover:border-[#5236ab] hover:bg-gray-50 transition-all duration-200"
                   onClick={() => {
@@ -1018,15 +1460,20 @@ function App() {
                   }}
                 >
                   {Icon('Monitor', 32, "w-8 h-8 mb-2 text-[#5236ab]")}
-                  <span className="font-medium">Screen Recording</span>
-                  <span className="text-xs text-gray-500 mt-1">{isLiveMode ? 'With Live Transcript' : 'Standard'}</span>
+                  <span className="font-medium">Screen + Audio</span>
+                  <span className="text-xs text-gray-500 mt-1">
+                    {isLiveMode ? 'Live Teams/Meeting Audio' : 'Record Meeting'}
+                  </span>
+                  <span className="text-xs text-blue-600 mt-1 font-medium">
+                    Captures System + Mic Audio
+                  </span>
                 </button>
               </div>
             )}
             
-            {/* Stop Recording Button when recording is active */}
+            {/* Enhanced Stop Recording Button */}
             {(isRecording || isScreenRecording) && (
-              <div className="flex justify-center">
+              <div className="flex flex-col items-center space-y-3">
                 <button
                   onClick={() => {
                     if (isRecording) {
@@ -1040,45 +1487,74 @@ function App() {
                   {Icon('StopCircle', 24, "w-6 h-6 mr-2")}
                   Stop {isScreenRecording ? 'Screen Recording' : 'Audio Recording'}
                 </button>
+                
+                {/* Enhanced Recording Status */}
+                <div className="text-center space-y-2">
+                  <div className="flex items-center justify-center">
+                    <div className="w-3 h-3 bg-red-500 rounded-full mr-2 animate-pulse"></div>
+                    <span className="text-sm font-medium">
+                      {isRecording ? 'Recording audio...' : 'Recording screen and audio...'}
+                      {isLiveMode && ' with live transcription'}
+                    </span>
+                  </div>
+                  
+                  {/* System audio status indicator for screen recording */}
+                  {isScreenRecording && (
+                    <div className="text-xs text-gray-600 bg-gray-100 rounded-md px-2 py-1 inline-block">
+                      {systemAudioAvailable 
+                        ? '🎵 System audio + microphone being captured' 
+                        : '🎤 Microphone only (enable "Share system audio" for better results)'}
+                    </div>
+                  )}
+                  
+                  {/* WebSocket connection status */}
+                  {isLiveMode && (
+                    <div className="flex items-center justify-center text-xs text-gray-500">
+                      <div className={`w-2 h-2 rounded-full mr-1 ${
+                        isLiveTranscriptionActive.current ? 'bg-green-500' : 'bg-red-500'
+                      }`}></div>
+                      Live transcription: {isLiveTranscriptionActive.current ? 'Connected' : 'Disconnected'}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
-            
-            {/* Recording status with connection indicator */}
-            {(isRecording || isScreenRecording) && (
-              <div className="flex flex-col items-center justify-center mt-2 space-y-2">
-                <div className="flex items-center">
-                  <div className="w-3 h-3 bg-red-500 rounded-full mr-2 animate-pulse"></div>
-                  <span className="text-sm font-medium">
-                    {isRecording ? 'Recording audio...' : 'Recording screen and audio...'}
-                    {isLiveMode && ' with live transcription'}
-                  </span>
-                </div>
-                
-                {/* WebSocket connection status */}
-                {isLiveMode && (
-                  <div className="flex items-center text-xs text-gray-500">
-                    <div className={`w-2 h-2 rounded-full mr-1 ${
-                      isLiveTranscriptionActive.current ? 'bg-green-500' : 'bg-red-500'
-                    }`}></div>
-                    Live transcription: {isLiveTranscriptionActive.current ? 'Connected' : 'Disconnected'}
+
+            {/* System Audio Tips */}
+            {!isRecording && !isScreenRecording && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mt-4">
+                <div className="flex items-start">
+                  {Icon('Info', 20, "w-5 h-5 text-blue-500 mr-2 mt-0.5")}
+                  <div>
+                    <h4 className="text-sm font-medium text-blue-800 mb-1">
+                      Tips for Capturing Meeting Audio
+                    </h4>
+                    <ul className="text-xs text-blue-600 space-y-1">
+                      <li>• <strong>Teams/Zoom Meetings:</strong> Use "Screen + Audio" and select "Share system audio"</li>
+                      <li>• <strong>Browser Meetings:</strong> Share the specific browser tab with audio enabled</li>
+                      <li>• <strong>Best Results:</strong> Enable live mode for real-time transcription</li>
+                      <li>• <strong>Audio Quality:</strong> Ensure your microphone and system volume are properly set</li>
+                    </ul>
                   </div>
-                )}
+                </div>
               </div>
             )}
           </div>
         </Card>
 
-        {/* Live Transcript Display - Improved */}
+        {/* Live Transcript Display - Enhanced */}
         {((isRecording || isScreenRecording) && isLiveMode) && (
           <Card title="Live Transcript with Timestamps" icon={Icon('Mic')} fullWidth>
             <div className="max-h-80 overflow-y-auto my-2 p-4 bg-gray-50 rounded-lg">
-              {/* Debug info - only show in development */}
+              {/* Enhanced debug info - only show in development */}
               {process.env.NODE_ENV === 'development' && (
                 <div className="mb-2 p-2 bg-gray-100 text-xs rounded">
                   <div className="grid grid-cols-2 gap-1">
                     <div>Live segments: <span className="font-mono">{liveSegments.length || 0}</span></div>
                     <div>Text length: <span className="font-mono">{liveTranscript?.length || 0}</span></div>
                     <div>WebSocket: <span className="font-mono">{isLiveTranscriptionActive.current ? 'Connected' : 'Disconnected'}</span></div>
+                    <div>Audio Mode: <span className="font-mono">{audioStreamType}</span></div>
+                    <div>System Audio: <span className="font-mono">{systemAudioAvailable ? 'Yes' : 'No'}</span></div>
                     <div>Processed IDs: <span className="font-mono">{processedSegmentIds.current.size}</span></div>
                   </div>
                 </div>
@@ -1119,8 +1595,8 @@ function App() {
               >
                 Your browser does not support the audio element.
               </audio>
-              {/* Generate Transcript Button - Placed below the audio player */}
-              {currentStep === 2 && !isLiveMode && (
+              {/* Generate Transcript Button - Always show when audio is available and not in live mode */}
+              {audioUrl && !isLiveMode && (
                 <div className="mt-4 flex justify-center">
                   <button
                     onClick={() => handleGenerateTranscript(uploadedAudioFile || undefined)}
@@ -1264,7 +1740,10 @@ function App() {
         {/* Error Display */}
         {error && (
           <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mt-4">
-            {error}
+            <div className="flex items-center">
+              {Icon('AlertCircle', 20, "w-5 h-5 mr-2")}
+              {error}
+            </div>
           </div>
         )}
 
@@ -1285,7 +1764,7 @@ function App() {
           </div>
         )}
 
-        {/* Processing Indicator */}
+        {/* Enhanced Processing Indicator */}
         {(transcriber.isBusy || isProcessing || isGeneratingActions || isTranscribing) && (
           <div className="fixed bottom-4 right-4 bg-white rounded-lg shadow-lg p-4 z-40 flex items-center">
             <div className="mr-3 w-6 h-6 border-t-2 border-[#5236ab] border-solid rounded-full animate-spin" />
@@ -1296,7 +1775,12 @@ function App() {
                  isGeneratingActions ? 'Extracting Action Items...' : 
                  'Processing Audio...'}
               </p>
-              <p className="text-xs text-gray-500">Processing in background...</p>
+              <p className="text-xs text-gray-500">
+                {isTranscribing ? 'Analyzing audio content...' :
+                 isProcessing ? 'Creating meeting summary...' :
+                 isGeneratingActions ? 'Finding actionable items...' :
+                 'Processing in background...'}
+              </p>
             </div>
           </div>
         )}

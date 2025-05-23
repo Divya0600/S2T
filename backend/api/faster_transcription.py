@@ -309,7 +309,10 @@ class FasterTranscriber:
             
             # Skip if audio is too quiet
             if np.abs(combined_audio).max() < 0.01:
+                logger.debug("Audio too quiet, skipping transcription")
                 return
+            
+            logger.debug(f"Processing audio chunk: {len(combined_audio)} samples, max amplitude: {np.abs(combined_audio).max():.3f}")
             
             # Transcribe the combined audio
             segments, info = self.model.transcribe(
@@ -338,11 +341,25 @@ class FasterTranscriber:
                 
                 # Check if this is a duplicate
                 if not self._is_duplicate_segment(segment_text, adjusted_start, adjusted_end):
+                    # Handle different confidence attribute names - FIXED
+                    confidence_score = 0.0
+                    try:
+                        if hasattr(segment, 'avg_logprob'):
+                            confidence_score = segment.avg_logprob
+                        elif hasattr(segment, 'confidence'):
+                            confidence_score = segment.confidence
+                        elif hasattr(segment, 'logprob'):
+                            confidence_score = segment.logprob
+                        elif hasattr(segment, 'no_speech_prob'):
+                            confidence_score = 1.0 - segment.no_speech_prob  # Convert to confidence
+                    except AttributeError:
+                        confidence_score = 0.0
+                    
                     new_segments.append({
                         'start': adjusted_start,
                         'end': adjusted_end,
                         'text': segment_text,
-                        'confidence': getattr(segment, 'avg_logprob', 0.0)
+                        'confidence': confidence_score
                     })
             
             # Merge with existing segments and remove overlaps
@@ -363,7 +380,8 @@ class FasterTranscriber:
                     "text": full_text,
                     "segments": new_segments,  # Only send new segments
                     "all_segments": self.all_segments,  # Send all for context
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
+                    "chunk_id": int(time.time() * 1000)  # Add unique chunk ID
                 }
                 
                 # Put result in queue and call callback
@@ -373,6 +391,8 @@ class FasterTranscriber:
                     self.callback(full_text, result)
                 
                 logger.info(f"Processed {len(new_segments)} new segments, total: {len(self.all_segments)}")
+            else:
+                logger.debug("No new segments found in this audio chunk")
             
             # Update processed duration (move forward by half the buffer to maintain overlap)
             advance_duration = buffer_duration * 0.6  # 60% advance for some overlap
@@ -383,7 +403,7 @@ class FasterTranscriber:
                 self.audio_buffer = deque([self.audio_buffer[-1]], maxlen=10)
             
         except Exception as e:
-            logger.error(f"Error processing accumulated audio: {e}")
+            logger.error(f"Error processing accumulated audio: {e}", exc_info=True)
     
     def stop(self):
         """Stop the audio stream and cleanup resources."""
@@ -489,7 +509,7 @@ class FasterTranscriber:
                     break
     
     def _transcribe_internal(self, file_path):
-        """Internal method to transcribe a file."""
+        """Internal method to transcribe a file - FIXED VERSION."""
         try:
             logger.info(f"Starting transcription of {file_path}")
             segments, info = self.model.transcribe(
@@ -503,11 +523,26 @@ class FasterTranscriber:
             # Convert generator to list and process segments
             segments_list = []
             for segment in segments:
+                # Handle different attribute names for confidence score - FIXED
+                confidence_score = 0.0
+                try:
+                    if hasattr(segment, 'avg_logprob'):
+                        confidence_score = segment.avg_logprob
+                    elif hasattr(segment, 'confidence'):
+                        confidence_score = segment.confidence
+                    elif hasattr(segment, 'logprob'):
+                        confidence_score = segment.logprob
+                    elif hasattr(segment, 'no_speech_prob'):
+                        confidence_score = 1.0 - segment.no_speech_prob  # Convert to confidence
+                except AttributeError as e:
+                    logger.debug(f"Could not get confidence score: {e}")
+                    confidence_score = 0.0
+                
                 segments_list.append({
                     'start': segment.start,
                     'end': segment.end,
                     'text': segment.text.strip(),
-                    'confidence': segment.avg_logprob
+                    'confidence': confidence_score
                 })
             
             return segments_list, info
