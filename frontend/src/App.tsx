@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useTranscriber, formatTimestamp } from "./hooks/useTranscriber";
 import Transcript from "./components/Transcript";
 import Progress from "./components/Progress";
@@ -82,7 +82,15 @@ function App() {
   const [isScreenRecording, setIsScreenRecording] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
-  const [liveSegments, setLiveSegments] = useState<Array<{text: string, start?: number, end?: number}>>([]);
+  // Define a type for transcript segments
+  type TranscriptSegment = {
+    text: string, 
+    start?: number, 
+    end?: number, 
+    timestamp?: [number, number | null]
+  };
+  
+  const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -548,18 +556,41 @@ function App() {
     console.log('Starting screen recording. Live transcript:', withLiveTranscript);
 
     try {
+      // First request system audio specifically with the displayMedia
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
         video: { displaySurface: 'monitor', frameRate: { ideal: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-        audio: true // Capture system audio
+        audio: {
+          // Explicitly request system audio capture
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
       });
 
+      // Check if we actually got system audio tracks
+      const hasScreenAudio = displayStream.getAudioTracks().length > 0;
+      if (hasScreenAudio) {
+        console.log('Successfully captured system audio tracks:', displayStream.getAudioTracks());
+      } else {
+        console.warn('No system audio tracks captured. Make sure to enable "Share system audio" in the browser dialog');
+        alert('Please make sure you enable "Share system audio" in the browser dialog to capture system sounds.');
+      }
+
+      // Get microphone audio separately
       const audioStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       });
 
+      // Create a combined stream with all tracks
       const combinedStream = new MediaStream();
-      displayStream.getTracks().forEach(track => combinedStream.addTrack(track));
-      audioStream.getTracks().forEach(track => combinedStream.addTrack(track));
+      // Add video tracks first
+      displayStream.getVideoTracks().forEach(track => combinedStream.addTrack(track));
+      // Add microphone audio
+      audioStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
+      // Add system audio if available
+      if (hasScreenAudio) {
+        displayStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
+      }
 
       console.log('Combined stream for screen recording created. Video:', combinedStream.getVideoTracks().length, 'Audio:', combinedStream.getAudioTracks().length);
 
@@ -577,18 +608,49 @@ function App() {
         }
       };
 
-      screenRecorder.onstop = () => {
+      screenRecorder.onstop = async () => {
         console.log('Screen recorder stopped.');
         setIsScreenRecording(false);
         const videoBlob = new Blob(screenAudioChunksRef.current, { type: 'video/webm' });
+        
         if (videoBlob.size > 0) {
-          const videoFile = new File([videoBlob], 'screen_recording.webm', { type: videoBlob.type });
+          const videoFile = new File([videoBlob], `screen_recording_${Date.now()}.webm`, { type: videoBlob.type });
           console.log('Screen recording finished, blob size:', videoBlob.size);
+          
+          // Create and save the audio URL for playback
+          const url = URL.createObjectURL(videoBlob);
+          setAudioUrl(url);
+          console.log('Created audio URL for playback:', url);
+          
+          // If this was a live transcript, save the live segments to the regular transcript
+          if (withLiveTranscript && liveSegments.length > 0) {
+            console.log('Transferring live segments to transcript', liveSegments);
+            setCurrentStep(2); // Move to transcript step
+          }
           
           // Send the recorded video for transcription
           if (transcriber && typeof transcriber.transcribeFile === 'function') {
-            transcriber.transcribeFile(videoFile);
+            try {
+              setIsTranscribing(true);
+              const result = await transcriber.transcribeFile(videoFile);
+              setIsTranscribing(false);
+              console.log('Transcription completed:', result);
+              
+              // Make sure we display the result properly
+              if (withLiveTranscript) {
+                // If we were in live mode, the transcript should stay in the state
+                console.log('Live transcription complete');
+              }
+              setCurrentStep(2); // Move to transcript step
+            } catch (error) {
+              console.error('Transcription error:', error);
+              setIsTranscribing(false);
+              setError('Failed to transcribe recording: ' + (error instanceof Error ? error.message : String(error)));
+            }
           }
+        } else {
+          console.warn('No data recorded - blob size is 0');
+          setError('Recording failed: No audio data captured');
         }
       };
 
@@ -607,9 +669,28 @@ function App() {
         const audioSource = audioContext.createMediaStreamSource(combinedStream);
         
         // Create a processor to send audio data to transcription service
+        // Use an analyzer node for better performance (createScriptProcessor is deprecated)
         const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        const processorRef = { current: processor }; // Keep a reference we can access in cleanup
         
+        // Only process audio when recording is active
         processor.onaudioprocess = async (e) => {
+          // Check if we're still recording before processing
+          if (!isScreenRecording || !webSocketRef.current) {
+            console.log('Audio processing stopped because recording has ended');
+            
+            // Disconnect the processor to stop processing
+            try {
+              if (processorRef.current) {
+                processorRef.current.disconnect();
+                console.log('Audio processor disconnected');
+              }
+            } catch (err) {
+              console.error('Error disconnecting processor:', err);
+            }
+            return;
+          }
+          
           // Get audio data
           const audioData = e.inputBuffer.getChannelData(0);
           
@@ -618,7 +699,16 @@ function App() {
           
           // Send to WebSocket if connected
           if (webSocketRef.current?.readyState === WebSocket.OPEN) {
-            webSocketRef.current.send(pcmData.buffer);
+            try {
+              webSocketRef.current.send(pcmData.buffer);
+            } catch (err) {
+              console.error('Error sending audio data:', err);
+              // If we encounter an error sending data, stop processing
+              if (processorRef.current) {
+                processorRef.current.disconnect();
+                console.log('Audio processor disconnected due to error');
+              }
+            }
           }
         };
         
@@ -639,18 +729,72 @@ function App() {
           }));
         };
         
+        // Create a unique ID for this recording session to track segments
+        const sessionId = Date.now().toString();
+        const isRecordingRef = { current: true };
+        
+        // Track the last seen segment to detect new content
+        let lastProcessedSegment: { text: string; start: number; end: number } | null = null;
+        
         ws.onmessage = (event) => {
+          // First check if we're still recording
+          if (!isRecordingRef.current || !isScreenRecording) {
+            console.log('Ignoring WebSocket message because recording has stopped');
+            return;
+          }
+          
           try {
             const data = JSON.parse(event.data);
-            console.log('Screen recording transcription received:', data);
+            console.log(`Screen recording transcription received (session ${sessionId}):`, data);
             
-            if (data.segments && data.segments.length > 0) {
-              setLiveSegments(prev => [...prev, ...data.segments]);
+            if (data.segments && Array.isArray(data.segments) && data.segments.length > 0) {
+              // Get the most recent segment from the server
+              const latestSegment = data.segments[data.segments.length - 1];
+              
+              // Skip if this is the same as the last processed segment
+              if (lastProcessedSegment && 
+                  lastProcessedSegment.text === latestSegment.text && 
+                  lastProcessedSegment.start === (latestSegment.start || 0) &&
+                  lastProcessedSegment.end === (latestSegment.end || 0)) {
+                console.log('Skipping duplicate segment:', latestSegment.text);
+                return;
+              }
+              
+              // Only process if we have a new segment
+              const newSegment = {
+                text: latestSegment.text || '',
+                start: latestSegment.start || 0,
+                end: latestSegment.end || 0
+              };
+              
+              // Update our last processed segment
+              lastProcessedSegment = { ...newSegment };
+              
+              // Add the new segment to our state
+              setLiveSegments(prevSegments => {
+                // Only add if this is a new segment
+                const isNewSegment = !prevSegments.some(s => 
+                  s.text === newSegment.text && 
+                  s.start === newSegment.start && 
+                  s.end === newSegment.end
+                );
+                
+                if (isNewSegment) {
+                  console.log('Adding new segment:', newSegment.text);
+                  return [...prevSegments, newSegment];
+                }
+                
+                console.log('Skipping duplicate segment in state update');
+                return prevSegments;
+              });
             }
           } catch (err) {
             console.error('Error processing transcript:', err);
           }
         };
+        
+        // Store the isRecordingRef in a ref so we can access it in cleanup
+        const isRecordingRefCurrent = isRecordingRef;
       }
 
       // Start the screen recorder
@@ -662,6 +806,81 @@ function App() {
       setIsScreenRecording(false);
     }
   };
+
+  const stopScreenRecording = useCallback(() => {
+    console.log('Stopping screen recording...');
+    
+    // Set recording state to false immediately to prevent further processing
+    setIsScreenRecording(false);
+    
+    // Create a snapshot of the current segments to preserve them
+    const finalSegments = [...liveSegments];
+    console.log(`Preserving ${finalSegments.length} segments at stop time`);
+    
+    // Stop the media recorder first
+    if (screenMediaRecorderRef.current) {
+      if (screenMediaRecorderRef.current.state === 'recording') {
+        screenMediaRecorderRef.current.stop();
+        console.log('Screen recorder stopped');
+      }
+      
+      // Stop all tracks in the stream to ensure complete disconnection
+      const tracks = screenMediaRecorderRef.current.stream?.getTracks() || [];
+      tracks.forEach(track => {
+        track.stop();
+        console.log(`Stopped track: ${track.kind}`);
+      });
+      
+      screenMediaRecorderRef.current = null;
+    }
+    
+    // Clean up WebSocket immediately to stop receiving messages
+    if (webSocketRef.current) {
+      console.log('Closing WebSocket connection');
+      
+      // First remove all event listeners to prevent any more processing
+      if (webSocketRef.current) {
+        webSocketRef.current.onmessage = null;
+        webSocketRef.current.onerror = null;
+        webSocketRef.current.onclose = null;
+      }
+      
+      if (webSocketRef.current.readyState === WebSocket.OPEN) {
+        // Send a message to inform the server we're stopping
+        try {
+          webSocketRef.current.send(JSON.stringify({ command: 'stop' }));
+          console.log('Sent stop command to WebSocket server');
+        } catch (e) {
+          console.error('Failed to send stop command:', e);
+        }
+        webSocketRef.current.close(1000, 'Client stopped recording');
+      }
+      webSocketRef.current = null;
+    }
+    
+    // Clean up audio context if it was created
+    if (audioContextRef.current) {
+      console.log('Closing audio context');
+      audioContextRef.current.close()
+        .then(() => console.log('Audio context closed successfully'))
+        .catch(e => console.error('Error closing audio context:', e));
+      audioContextRef.current = null;
+    }
+    
+    // If in live mode, ensure we preserve the final transcript
+    if (isLiveMode) {
+      console.log('Live transcription mode stopped. Final data:', finalSegments);
+      
+      // Explicitly set the final segments to ensure we keep them
+      setTimeout(() => {
+        setLiveSegments(finalSegments);
+        setCurrentStep(2); // Move to transcript step
+      }, 100);
+    }
+    
+    setIsLiveMode(false); // Ensure live mode is turned off
+    console.log('Screen recording cleanup completed');
+  }, [isLiveMode, liveSegments, screenMediaRecorderRef, webSocketRef, audioContextRef, setCurrentStep]);
 
   const stopAudioRecording = (): void => {
     console.log('stopAudioRecording called. Current state:', mediaRecorderRef.current?.state);
@@ -679,44 +898,64 @@ function App() {
     }
   };
 
-  const stopScreenRecording = (): void => {
-    console.log('stopScreenRecording called. Current state:', screenMediaRecorderRef.current?.state);
-    if (screenMediaRecorderRef.current && screenMediaRecorderRef.current.state === 'recording') {
-      screenMediaRecorderRef.current.stop(); // Triggers 'onstop'
-    } else {
-      console.warn('Screen recorder not recording or not initialized.');
-      setIsScreenRecording(false);
-    }
-    // Stream tracks are stopped in onstop or onerror.
-    
-    // Also close audio context if it exists
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(e => console.error('Error closing audio context:', e));
-      audioContextRef.current = null;
-    }
-    
-    // Close WebSocket connection
-    if (webSocketRef.current) {
-      webSocketRef.current.close();
-      webSocketRef.current = null;
-    }
-    
-    // Add code to update transcript state with live segments
+  // No redeclaration needed here, we already defined the type and state above
+
+  // Effect to handle live segments when they change
+  useEffect(() => {
+    // Only process if we have segments
     if (liveSegments.length > 0) {
-      const fullText = liveSegments.map(segment => segment.text).join(' ');
+      console.log(`Live segments updated: ${liveSegments.length} segments`);
       
-      transcriber.output = {
-        isBusy: false,
-        text: fullText,
-        chunks: liveSegments.map(segment => ({
-          text: segment.text,
-          timestamp: [segment.start || 0, segment.end || 0]
-        }))
-      };
+      // Create a clean, non-repetitive transcript text
+      // First sort segments by start time to ensure proper order
+      const sortedSegments = [...liveSegments].sort((a, b) => 
+        (a.start || 0) - (b.start || 0)
+      );
       
-      setCurrentStep(2);
+      // Then remove duplicate segments with same text (keep the first occurrence)
+      const uniqueSegments: TranscriptSegment[] = [];
+      const textSet = new Set<string>();
+      
+      for (const segment of sortedSegments) {
+        // Skip empty segments
+        if (!segment.text?.trim()) continue;
+        
+        // Use combination of text and timestamp as a unique identifier
+        const key = `${segment.text}-${segment.start || 0}-${segment.end || 0}`;
+        
+        if (!textSet.has(key)) {
+          textSet.add(key);
+          uniqueSegments.push(segment);
+        }
+      }
+      
+      // Join the text with spaces
+      const fullText = uniqueSegments.map(segment => segment.text).join(' ');
+      
+      // Log the unique segments for debugging
+      console.log(`After deduplication: ${uniqueSegments.length} unique segments`);
+      
+      if (transcriber && transcriber.output) {
+        // Update the transcriber output with live segments
+        transcriber.output = {
+          isBusy: false,
+          text: fullText,
+          chunks: uniqueSegments.map(segment => ({
+            text: segment.text,
+            timestamp: [segment.start || 0, segment.end || 0] as [number, number | null]
+          }))
+        };
+        
+        // Only move to transcript step if we're not actively recording
+        if (!isScreenRecording && !isRecording) {
+          // Wait a short time to ensure all cleanup is done
+          setTimeout(() => {
+            setCurrentStep(2);
+          }, 100);
+        }
+      }
     }
-  };
+  }, [liveSegments, transcriber, isScreenRecording, isRecording, setCurrentStep]);
 
   // Save Functions
   const saveSummary = () => {

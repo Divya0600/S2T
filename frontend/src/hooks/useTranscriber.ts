@@ -144,6 +144,7 @@ export function useTranscriber(): Transcriber {
     
     // WebSocket reference for streaming audio
     const webSocketRef = useRef<WebSocket | null>(null);
+    const isStreamingRef = useRef<boolean>(false);
 
     // Clean up audio resources when component unmounts
     useEffect(() => {
@@ -157,7 +158,7 @@ export function useTranscriber(): Transcriber {
     // Audio context and media recorder for live whisper transcription
     const audioContextRef = useRef<AudioContext | null>(null);
     const micStreamRef = useRef<MediaStream | null>(null);
-    const streamingCallbackRef = useRef<((text: string) => void) | null>(null);
+    const streamingCallbackRef = useRef<((text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void) | null>(null);
     
     // Media recorder for audio/screen recording
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -347,10 +348,9 @@ export function useTranscriber(): Transcriber {
       } finally {
         setIsBusy(false);
       }
-    }, [engine, setTranscript]); // Ensure `engine` and `setTranscript` are in the dependency array
+    }, [engine, setTranscript]);
 
-
-    // Live streaming functionality
+    // Live streaming functionality - FIXED VERSION
     const startStreaming = useCallback(async (updateCallback: (text: string, segments?: Array<{text: string, start?: number, end?: number}>) => void, options?: {
         captureBothIO?: boolean;
         inputDevice?: string | number | null;
@@ -358,13 +358,21 @@ export function useTranscriber(): Transcriber {
     }) => {
         console.log('Starting streaming transcription with engine:', engine);
         
-        if (isBusy) {
-            console.log('Transcriber is busy, cannot start streaming');
+        if (isBusy || isStreamingRef.current) {
+            console.log('Transcriber is busy or already streaming, cannot start streaming');
             return;
         }
         
         setIsBusy(true);
+        isStreamingRef.current = true;
         streamingCallbackRef.current = updateCallback;
+        
+        // Clear any existing transcript when starting new stream
+        setTranscript({
+            isBusy: true,
+            text: '',
+            chunks: [],
+        });
         
         // Close any existing WebSocket connection
         if (webSocketRef.current) {
@@ -384,8 +392,32 @@ export function useTranscriber(): Transcriber {
             webSocketRef.current.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    if (data.text) {
-                        updateCallback(data.text, data.segments);
+                    
+                    // Only process if we're still streaming
+                    if (!isStreamingRef.current) {
+                        console.log('Ignoring message - streaming stopped');
+                        return;
+                    }
+                    
+                    if (data.text && streamingCallbackRef.current) {
+                        // Process the segments to avoid duplicates
+                        const segments = data.segments || [];
+                        
+                        // Update transcript state with the LATEST complete text
+                        // Don't accumulate - just show the current complete transcription
+                        setTranscript(prev => ({
+                            isBusy: true,
+                            text: data.text, // Use the complete text from the server
+                            chunks: segments.map((seg: any) => ({
+                                text: seg.text,
+                                start: seg.start,
+                                end: seg.end,
+                                timestamp: [seg.start, seg.end]
+                            })),
+                        }));
+                        
+                        // Call the update callback with the latest text
+                        streamingCallbackRef.current(data.text, segments);
                     }
                 } catch (error) {
                     console.error('Error processing WebSocket message:', error);
@@ -395,18 +427,21 @@ export function useTranscriber(): Transcriber {
             webSocketRef.current.onerror = (error) => {
                 console.error('WebSocket error:', error);
                 setIsBusy(false);
+                isStreamingRef.current = false;
                 streamingCallbackRef.current = null;
             };
             
             webSocketRef.current.onclose = () => {
                 console.log('WebSocket connection closed');
                 setIsBusy(false);
+                isStreamingRef.current = false;
                 streamingCallbackRef.current = null;
                 webSocketRef.current = null;
             };
         } catch (error) {
             console.error('Error setting up WebSocket:', error);
             setIsBusy(false);
+            isStreamingRef.current = false;
             streamingCallbackRef.current = null;
             return;
         }
@@ -415,7 +450,10 @@ export function useTranscriber(): Transcriber {
     const stopStreaming = useCallback(async () => {
         console.log('Stopping streaming and cleaning up resources');
         
-        // First, clear the streaming callback to prevent further updates
+        // Set streaming flag to false first to prevent processing new messages
+        isStreamingRef.current = false;
+        
+        // Clear the streaming callback to prevent further updates
         const currentCallback = streamingCallbackRef.current;
         streamingCallbackRef.current = null;
         
@@ -466,19 +504,20 @@ export function useTranscriber(): Transcriber {
             console.error('Error stopping server transcription:', error);
         }
         
-        // Clear any pending transcription state
-        if (currentCallback) {
-            currentCallback(''); // Clear the transcription with empty string
-        }
+        // Finalize the transcript (mark as not busy)
+        setTranscript(prev => prev ? {
+            ...prev,
+            isBusy: false
+        } : undefined);
         
         // Reset recording state
         setIsRecording(false);
         setIsBusy(false);
         
         console.log('Streaming and transcription fully stopped');
-    }, [isLiveMode, transcript, transcribeFile]);
+    }, []);
     
-    // Recording functions
+    // Recording functions - FIXED VERSION
     const startRecording = useCallback(async () => {
         try {
             setIsBusy(true);
@@ -521,12 +560,18 @@ export function useTranscriber(): Transcriber {
             if (isLiveMode) {
                 console.log('Live mode enabled, starting streaming transcription');
                 startStreaming((text, segments) => {
-                    // Only update if we still have a valid callback (streaming is active)
-                    if (streamingCallbackRef.current) {
+                    // Only update if we're still recording and streaming is active
+                    if (isRecording && isStreamingRef.current) {
+                        // Don't accumulate text in live mode - just show current transcription
                         setTranscript(prev => ({
                             isBusy: true,
-                            text: text, // Only show the latest text, don't accumulate
-                            chunks: segments || [],
+                            text: text, // Show current text only
+                            chunks: segments ? segments.map(seg => ({
+                                text: seg.text,
+                                start: seg.start,
+                                end: seg.end,
+                                timestamp: [seg.start || 0, seg.end || null]
+                            })) : [],
                         }));
                     }
                 });
@@ -536,13 +581,19 @@ export function useTranscriber(): Transcriber {
         } finally {
             setIsBusy(false);
         }
-    }, [isLiveMode, startStreaming, transcribeFile]);
+    }, [isLiveMode, startStreaming, transcribeFile, isRecording]);
     
     const stopRecording = useCallback(async () => {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
             try {
                 console.log('Stopping media recorder and cleaning up');
                 const recorder = mediaRecorderRef.current;
+                
+                // Stop streaming first if live mode was enabled
+                if (isLiveMode && isStreamingRef.current) {
+                    console.log('Stopping live streaming');
+                    await stopStreaming();
+                }
                 
                 // Stop the media recorder
                 return new Promise<void>((resolve) => {
@@ -559,19 +610,9 @@ export function useTranscriber(): Transcriber {
                             streamRef.current = null;
                         }
                         
-                        // Stop streaming if live mode was enabled
-                        if (isLiveMode) {
-                            console.log('Stopping live streaming');
-                            stopStreaming().finally(() => {
-                                setIsRecording(false);
-                                console.log('Recording and streaming fully stopped');
-                                resolve();
-                            });
-                        } else {
-                            setIsRecording(false);
-                            console.log('Recording stopped');
-                            resolve();
-                        }
+                        setIsRecording(false);
+                        console.log('Recording stopped');
+                        resolve();
                     };
                     
                     recorder.addEventListener('stop', onStop);
@@ -598,42 +639,63 @@ export function useTranscriber(): Transcriber {
             console.info('IMPORTANT: When sharing your screen, please select "Share system audio" option if available');
             
             // Request screen sharing with audio (this will capture system OUTPUT audio on supported browsers)
+            // First request system audio specifically with the displayMedia
             const screenStream = await navigator.mediaDevices.getDisplayMedia({
                 video: { 
                     frameRate: { ideal: 30 },
                     width: { ideal: 1920 },
                     height: { ideal: 1080 } 
                 },
-                audio: true // Try to capture system audio output
+                audio: {
+                    // Explicitly request system audio capture
+                    // This ensures we're trying to get system audio, not just any audio
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                } 
             });
 
-            // Always try to get microphone input audio as well to capture both input and output
+            // Check if we actually got any system audio tracks
             let combinedStream = screenStream;
             const hasScreenAudio = screenStream.getAudioTracks().length > 0;
             
+            if (hasScreenAudio) {
+                console.log('Successfully captured system audio', screenStream.getAudioTracks());
+            } else {
+                console.warn('No system audio tracks captured. The browser might not support system audio capture.');
+            }
+            
             try {
-                // Get microphone audio to capture system input
-                console.log('Adding microphone audio to capture all audio sources');
+                // Get microphone audio separately
+                console.log('Adding microphone audio to capture voice input');
                 const micAudioStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
-                        echoCancellation: false, // Disable echo cancellation for better quality
-                        noiseSuppression: false, // Disable noise suppression for better quality
-                        autoGainControl: false // Disable auto gain for better quality
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
                     }
                 });
                 
-                // Combine all audio and video tracks
+                // Create a new stream with all tracks
                 const allTracks = [
-                    ...screenStream.getVideoTracks(),
-                    ...micAudioStream.getAudioTracks()
+                    ...screenStream.getVideoTracks()
                 ];
                 
-                // Add screen audio track if it exists
+                // Add microphone audio
+                if (micAudioStream.getAudioTracks().length > 0) {
+                    allTracks.push(...micAudioStream.getAudioTracks());
+                    console.log('Added microphone audio track');
+                }
+                
+                // Add screen audio track if it exists (system audio)
                 if (hasScreenAudio) {
                     allTracks.push(...screenStream.getAudioTracks());
-                    console.log('Combined both system output and microphone input audio');
+                    console.log('Combined both system audio and microphone audio');
                 } else {
                     console.log('No system audio detected, using microphone audio only');
+                    
+                    // Show a warning to the user that system audio isn't being captured
+                    alert('System audio capture is not available. Only microphone audio will be recorded. Please make sure you have enabled "Share system audio" in the browser sharing dialog.');
                 }
                 
                 combinedStream = new MediaStream(allTracks);
@@ -644,6 +706,7 @@ export function useTranscriber(): Transcriber {
                     console.log('Continuing with only system output audio');
                 } else {
                     console.warn('No audio tracks available for recording');
+                    alert('No audio tracks available for recording. Please ensure you have allowed audio access.');
                 }
             }
             
@@ -692,11 +755,13 @@ export function useTranscriber(): Transcriber {
             if (isLiveMode) {
                 console.log('Live mode enabled, starting streaming');
                 startStreaming((text) => {
-                    setTranscript(prev => ({
-                        isBusy: true,
-                        text: prev?.text ? `${prev.text}\n${text}` : text,
-                        chunks: [],
-                    }));
+                    if (isStreamingRef.current) {
+                        setTranscript(prev => ({
+                            isBusy: true,
+                            text: text, // Show current text, don't accumulate
+                            chunks: [],
+                        }));
+                    }
                 });
             }
         } catch (error) {
@@ -710,6 +775,8 @@ export function useTranscriber(): Transcriber {
         if (mediaRecorderRef.current) {
             mediaRecorderRef.current.stop();
             if (streamRef.current) {
+                streamRef.current.getTracks().forEach(track => track.stop());
+            }
         }
         
         // Stop streaming if live mode was enabled
@@ -719,25 +786,49 @@ export function useTranscriber(): Transcriber {
         
         setIsRecording(false);
         console.log('Recording stopped');
-    }
-}, [isLiveMode, stopStreaming]);
+    }, [isLiveMode, stopStreaming]);
 
-
-
-const transcriber = useMemo((): Transcriber => {
-    return {
+    const transcriber = useMemo((): Transcriber => {
+        return {
+            isBusy,
+            isModelLoading,
+            progressItems,
+            model,
+            setModel,
+            language,
+            setLanguage,
+            engine,
+            setEngine,
+            isRecording,
+            isLiveMode,
+            setIsLiveMode,
+            recordedMedia,
+            transcribeFile,
+            startStreaming,
+            stopStreaming,
+            startRecording,
+            stopRecording,
+            startScreenRecording,
+            stopScreenRecording,
+            onInputChange,
+            start: postRequest,
+            output: transcript,
+            multilingual,
+            setMultilingual,
+            quantized,
+            setQuantized,
+            subtask,
+            setSubtask,
+        };
+    }, [
         isBusy,
         isModelLoading,
         progressItems,
         model,
-        setModel,
         language,
-        setLanguage,
         engine,
-        setEngine,
         isRecording,
         isLiveMode,
-        setIsLiveMode,
         recordedMedia,
         transcribeFile,
         startStreaming,
@@ -747,42 +838,15 @@ const transcriber = useMemo((): Transcriber => {
         startScreenRecording,
         stopScreenRecording,
         onInputChange,
-        start: postRequest,
-        output: transcript,
+        postRequest,
+        transcript,
         multilingual,
         setMultilingual,
         quantized,
         setQuantized,
         subtask,
         setSubtask,
-    };
-}, [
-    isBusy,
-    isModelLoading,
-    progressItems,
-    model,
-    language,
-    engine,
-    isRecording,
-    isLiveMode,
-    recordedMedia,
-    transcribeFile,
-    startStreaming,
-    stopStreaming,
-    startRecording,
-    stopRecording,
-    startScreenRecording,
-    stopScreenRecording,
-    onInputChange,
-    postRequest,
-    transcript,
-    multilingual,
-    setMultilingual,
-    quantized,
-    setQuantized,
-    subtask,
-    setSubtask,
-]);
+    ]);
 
-return transcriber;
+    return transcriber;
 }

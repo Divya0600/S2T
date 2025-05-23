@@ -53,6 +53,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
+# Global state for live transcription
+live_transcription_state = {
+    "is_active": False,
+    "transcriber": None,
+    "processed_segments": set(),  # Track processed segment IDs to avoid duplicates
+    "current_text": "",
+    "current_segments": []
+}
+
 @app.post("/summarize")
 async def generate_summary(request: SummaryRequest, req: Request, limiter: None = Depends(rate_limiter)):
     """
@@ -232,7 +241,7 @@ async def transcribe_file(file: UploadFile = File(...), engine: str = Form("fast
             return {
                 "status": "completed", 
                 "transcript": result.get('text', ''),
-                "segments": result.get('segments', [])
+                "chunks": result.get('segments', [])  # Use 'chunks' key for consistency with frontend
             }
         else:
             # Handle legacy format (string only)
@@ -302,34 +311,33 @@ class TranscriberConfig(BaseModel):
     model_name: str = "base"
     language: Optional[str] = None
     chunk_duration_ms: int = 5000
-    engine: str = "whisper"  # Options: "faster_whisper", "xenova", or "whisper"
+    engine: str = "faster_whisper"  # Default to faster_whisper
 
 @app.post("/transcriber/start")
 async def start_transcription(config: TranscriberConfig):
     """Start the real-time transcription service with the given configuration."""
     try:
+        # Reset the live transcription state
+        live_transcription_state["processed_segments"] = set()
+        live_transcription_state["current_text"] = ""
+        live_transcription_state["current_segments"] = []
+        
         # Convert model to configuration dictionary
         transcriber_config = config.dict()
         
         # Log the engine choice
-        engine = transcriber_config.get('engine', 'whisper')
+        engine = transcriber_config.get('engine', 'faster_whisper')
         logger.info(f"Starting transcription with engine: {engine}")
         
-        # If using whisper, initialize the model but don't start anything
-        # (will be handled by the WebSocket connection)
-        if engine == 'whisper':
-            model_name = transcriber_config.get('model_name', 'base')
-            # Just initialize the model to make sure it loads
-            transcriber = get_whisper_transcriber(model_name)
-            return {"status": "ready", "config": transcriber_config}
-        else:
-            # Get or create the transcriber instance for faster-whisper or xenova
-            transcriber = get_transcriber(config=transcriber_config)
-            
-            # Start the transcription
-            transcriber.start()
-            
-            return {"status": "started", "config": transcriber_config}
+        # Get or create the transcriber instance
+        transcriber = get_transcriber(config=transcriber_config)
+        live_transcription_state["transcriber"] = transcriber
+        
+        # Start the transcription
+        transcriber.start()
+        live_transcription_state["is_active"] = True
+        
+        return {"status": "started", "config": transcriber_config}
     except Exception as e:
         logger.error(f"Error starting transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -338,15 +346,148 @@ async def start_transcription(config: TranscriberConfig):
 async def stop_transcription():
     """Stop the real-time transcription service."""
     try:
-        transcriber = get_transcriber()
+        # Reset the live transcription state
+        live_transcription_state["is_active"] = False
+        live_transcription_state["processed_segments"] = set()
+        live_transcription_state["current_text"] = ""
+        live_transcription_state["current_segments"] = []
+        
+        transcriber = live_transcription_state.get("transcriber") or get_transcriber()
         if transcriber:
             transcriber.stop()
+            live_transcription_state["transcriber"] = None
             return {"status": "stopped"}
         else:
             return {"status": "not_running"}
     except Exception as e:
         logger.error(f"Error stopping transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+def create_segment_id(segment):
+    """Create a unique ID for a segment based on its content and timing."""
+    start_time = segment.get('start', 0)
+    text = segment.get('text', '').strip()
+    # Create a unique identifier using start time and text hash
+    return f"{start_time:.2f}_{hash(text)}"
+
+@app.websocket("/transcriber/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time transcription results."""
+    await websocket.accept()
+    
+    try:
+        # Parse query parameters
+        query_params = dict(websocket.query_params)
+        engine = query_params.get('engine', 'faster_whisper')
+        
+        logger.info(f"WebSocket connection established with engine: {engine}")
+        
+        # Initialize transcriber with faster-whisper
+        config = {
+            'engine': 'faster_whisper',
+            'model_name': 'base',
+            'language': 'en'
+        }
+        
+        transcriber = get_transcriber(config=config)
+        live_transcription_state["transcriber"] = transcriber
+        live_transcription_state["is_active"] = True
+        
+        # Reset state for new session
+        live_transcription_state["processed_segments"] = set()
+        live_transcription_state["current_text"] = ""
+        live_transcription_state["current_segments"] = []
+        
+        # Start transcription
+        transcriber.start()
+        
+        logger.info("Real-time transcription started")
+        
+        # Main loop to send transcription results
+        while live_transcription_state["is_active"]:
+            try:
+                # Get the latest result from transcriber
+                result = transcriber.get_latest_result(block=False)
+                
+                if result and isinstance(result, dict):
+                    raw_segments = result.get("segments", [])
+                    
+                    # Process segments to avoid duplicates
+                    new_segments = []
+                    new_text_parts = []
+                    
+                    for segment in raw_segments:
+                        segment_id = create_segment_id(segment)
+                        
+                        # Only process if we haven't seen this segment before
+                        if segment_id not in live_transcription_state["processed_segments"]:
+                            live_transcription_state["processed_segments"].add(segment_id)
+                            
+                            # Format segment for frontend
+                            formatted_segment = {
+                                "text": segment.get("text", "").strip(),
+                                "start": segment.get("start"),
+                                "end": segment.get("end")
+                            }
+                            
+                            if formatted_segment["text"]:  # Only add non-empty segments
+                                new_segments.append(formatted_segment)
+                                new_text_parts.append(formatted_segment["text"])
+                    
+                    # Update current state with new segments only
+                    if new_segments:
+                        live_transcription_state["current_segments"].extend(new_segments)
+                        
+                        # Rebuild complete text from all segments
+                        complete_text = " ".join(seg["text"] for seg in live_transcription_state["current_segments"])
+                        live_transcription_state["current_text"] = complete_text
+                        
+                        # Send only the new segments to avoid duplication on frontend
+                        formatted_result = {
+                            "text": complete_text,  # Send complete text
+                            "segments": new_segments,  # Send only new segments
+                            "timestamp": time(),
+                            "is_partial": True
+                        }
+                        
+                        logger.info(f"Sending {len(new_segments)} new segments, total text length: {len(complete_text)}")
+                        await websocket.send_text(json.dumps(formatted_result))
+                
+                # Small delay to prevent overwhelming the connection
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error processing transcription result: {e}")
+                await asyncio.sleep(0.5)  # Longer delay on error
+                
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"Error in WebSocket connection: {e}")
+        try:
+            await websocket.send_text(json.dumps({"error": str(e)}))
+        except:
+            pass
+    finally:
+        # Cleanup
+        logger.info("Cleaning up WebSocket connection")
+        live_transcription_state["is_active"] = False
+        live_transcription_state["processed_segments"] = set()
+        live_transcription_state["current_text"] = ""
+        live_transcription_state["current_segments"] = []
+        
+        transcriber = live_transcription_state.get("transcriber")
+        if transcriber:
+            try:
+                transcriber.stop()
+            except Exception as e:
+                logger.error(f"Error stopping transcriber: {e}")
+            live_transcription_state["transcriber"] = None
+        
+        try:
+            await websocket.close()
+        except:
+            pass
 
 @app.post("/api/transcribe-live-chunk")
 async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):
@@ -408,51 +549,3 @@ async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error processing live audio chunk: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error transcribing live audio chunk: {str(e)}")
-
-@app.websocket("/transcriber/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time transcription results."""
-    await websocket.accept()
-    
-    try:
-        # Get config from first message
-        config_msg = await websocket.receive_text()
-        config = json.loads(config_msg)
-        
-        # Force faster-whisper for live transcription
-        config['engine'] = 'faster_whisper'
-        
-        # Initialize transcriber with faster-whisper
-        transcriber = get_transcriber(config=config)
-        transcriber.start()
-        
-        # Process incoming audio chunks if needed or use internal mic capture
-        # ...
-        
-        # Send transcription results back
-        while True:
-            result = transcriber.get_latest_result(block=False)
-            if result:
-                # Format result for frontend
-                formatted_result = {
-                    "text": result.get("text", ""),
-                    "segments": [
-                        {"text": seg["text"], "start": seg.get("start"), "end": seg.get("end")} 
-                        for seg in result.get("segments", [])
-                    ],
-                    "timestamp": time()
-                }
-                await websocket.send_text(json.dumps(formatted_result))
-            
-            await asyncio.sleep(0.1)  # Poll every 100ms
-            
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
-        # Cleanup transcription
-    except Exception as e:
-        logger.error(f"Error in WebSocket connection: {e}")
-        try:
-            await websocket.send_text(json.dumps({"error": str(e)}))
-            await websocket.close()
-        except:
-            pass
