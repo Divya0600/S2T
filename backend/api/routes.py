@@ -53,14 +53,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
-# Global state for live transcription
-live_transcription_state = {
-    "is_active": False,
-    "transcriber": None,
-    "processed_segments": set(),  # Track processed segment IDs to avoid duplicates
-    "current_text": "",
-    "current_segments": []
-}
+# Global state for live transcription - IMPROVED
+live_transcription_sessions = {}  # Store sessions by WebSocket ID
 
 @app.post("/summarize")
 async def generate_summary(request: SummaryRequest, req: Request, limiter: None = Depends(rate_limiter)):
@@ -288,9 +282,9 @@ async def list_engines():
         engines = [
             {
                 "id": "faster_whisper",
-                "name": "FasterWhisper (GPU)",
+                "name": "FasterWhisper (CPU/GPU)",
                 "available": faster_whisper_available,
-                "description": "Server-based transcription using faster-whisper. Requires GPU."
+                "description": "Server-based transcription using faster-whisper with improved real-time processing."
             }
         ]
         return {
@@ -310,32 +304,26 @@ async def health_check():
 class TranscriberConfig(BaseModel):
     model_name: str = "base"
     language: Optional[str] = None
-    chunk_duration_ms: int = 5000
-    engine: str = "faster_whisper"  # Default to faster_whisper
+    chunk_duration_ms: int = 3000  # Reduced for better real-time performance
+    engine: str = "faster_whisper"
 
 @app.post("/transcriber/start")
 async def start_transcription(config: TranscriberConfig):
     """Start the real-time transcription service with the given configuration."""
     try:
-        # Reset the live transcription state
-        live_transcription_state["processed_segments"] = set()
-        live_transcription_state["current_text"] = ""
-        live_transcription_state["current_segments"] = []
-        
-        # Convert model to configuration dictionary
+        # Convert model to configuration dictionary and remove engine parameter
         transcriber_config = config.dict()
+        transcriber_config.pop('engine', None)  # Remove engine as it's not a FasterTranscriber parameter
         
         # Log the engine choice
-        engine = transcriber_config.get('engine', 'faster_whisper')
+        engine = config.engine
         logger.info(f"Starting transcription with engine: {engine}")
         
         # Get or create the transcriber instance
         transcriber = get_transcriber(config=transcriber_config)
-        live_transcription_state["transcriber"] = transcriber
         
         # Start the transcription
         transcriber.start()
-        live_transcription_state["is_active"] = True
         
         return {"status": "started", "config": transcriber_config}
     except Exception as e:
@@ -346,16 +334,9 @@ async def start_transcription(config: TranscriberConfig):
 async def stop_transcription():
     """Stop the real-time transcription service."""
     try:
-        # Reset the live transcription state
-        live_transcription_state["is_active"] = False
-        live_transcription_state["processed_segments"] = set()
-        live_transcription_state["current_text"] = ""
-        live_transcription_state["current_segments"] = []
-        
-        transcriber = live_transcription_state.get("transcriber") or get_transcriber()
+        transcriber = get_transcriber()
         if transcriber:
             transcriber.stop()
-            live_transcription_state["transcriber"] = None
             return {"status": "stopped"}
         else:
             return {"status": "not_running"}
@@ -363,131 +344,186 @@ async def stop_transcription():
         logger.error(f"Error stopping transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def create_segment_id(segment):
-    """Create a unique ID for a segment based on its content and timing."""
-    start_time = segment.get('start', 0)
-    text = segment.get('text', '').strip()
-    # Create a unique identifier using start time and text hash
-    return f"{start_time:.2f}_{hash(text)}"
-
 @app.websocket("/transcriber/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time transcription results."""
+    """WebSocket endpoint for real-time transcription results with improved session management."""
+    session_id = f"session_{int(time() * 1000)}"
+    
     await websocket.accept()
+    logger.info(f"WebSocket connection established: {session_id}")
+    
+    # Initialize session state
+    session_state = {
+        "is_active": True,
+        "transcriber": None,
+        "processed_segments": set(),
+        "current_text": "",
+        "current_segments": [],
+        "websocket": websocket,
+        "last_chunk_id": 0
+    }
+    
+    live_transcription_sessions[session_id] = session_state
     
     try:
         # Parse query parameters
         query_params = dict(websocket.query_params)
         engine = query_params.get('engine', 'faster_whisper')
         
-        logger.info(f"WebSocket connection established with engine: {engine}")
+        logger.info(f"Initializing session {session_id} with engine: {engine}")
         
-        # Initialize transcriber with faster-whisper
+        # Initialize transcriber with improved settings - REMOVED ENGINE PARAMETER
         config = {
-            'engine': 'faster_whisper',
             'model_name': 'base',
-            'language': 'en'
+            'language': 'en',
+            'chunk_duration_ms': 2000,  # Reduced chunk duration for better real-time response
+            'compute_type': 'int8',
+            'device_type': 'cpu'
         }
         
-        transcriber = get_transcriber(config=config)
-        live_transcription_state["transcriber"] = transcriber
-        live_transcription_state["is_active"] = True
-        
-        # Reset state for new session
-        live_transcription_state["processed_segments"] = set()
-        live_transcription_state["current_text"] = ""
-        live_transcription_state["current_segments"] = []
+        transcriber = FasterTranscriber(**config)
+        session_state["transcriber"] = transcriber
         
         # Start transcription
         transcriber.start()
-        
-        logger.info("Real-time transcription started")
+        logger.info(f"Real-time transcription started for session {session_id}")
         
         # Main loop to send transcription results
-        while live_transcription_state["is_active"]:
+        last_update_time = time()
+        consecutive_empty_results = 0
+        
+        while session_state["is_active"]:
             try:
-                # Get the latest result from transcriber
+                # Check if WebSocket is still connected
+                if websocket.client_state.name != "CONNECTED":
+                    logger.info(f"WebSocket disconnected for session {session_id}")
+                    break
+                
+                # Get the latest result from transcriber (non-blocking)
                 result = transcriber.get_latest_result(block=False)
                 
                 if result and isinstance(result, dict):
+                    current_time = time()
+                    
+                    # Extract new segments from result
                     raw_segments = result.get("segments", [])
+                    complete_text = result.get("text", "")
+                    chunk_id = result.get("chunk_id", 0)
                     
-                    # Process segments to avoid duplicates
-                    new_segments = []
-                    new_text_parts = []
-                    
-                    for segment in raw_segments:
-                        segment_id = create_segment_id(segment)
+                    # Use chunk_id to prevent duplicates
+                    if chunk_id > session_state["last_chunk_id"]:
+                        session_state["last_chunk_id"] = chunk_id
                         
-                        # Only process if we haven't seen this segment before
-                        if segment_id not in live_transcription_state["processed_segments"]:
-                            live_transcription_state["processed_segments"].add(segment_id)
+                        if raw_segments or (complete_text and complete_text.strip() != session_state["current_text"].strip()):
+                            # Process segments to avoid duplicates using chunk-based deduplication
+                            new_segments = []
                             
-                            # Format segment for frontend
-                            formatted_segment = {
-                                "text": segment.get("text", "").strip(),
-                                "start": segment.get("start"),
-                                "end": segment.get("end")
-                            }
+                            for segment in raw_segments:
+                                segment_text = segment.get("text", "").strip()
+                                segment_start = segment.get("start", 0)
+                                segment_end = segment.get("end", segment_start)
+                                
+                                # Create a segment ID based on chunk and content
+                                segment_id = f"chunk_{chunk_id}_{segment_text}_{segment_start:.2f}"
+                                
+                                # Only process if we haven't seen this segment before
+                                if segment_id not in session_state["processed_segments"]:
+                                    session_state["processed_segments"].add(segment_id)
+                                    
+                                    # Format segment for frontend
+                                    formatted_segment = {
+                                        "text": segment_text,
+                                        "start": segment_start,
+                                        "end": segment_end
+                                    }
+                                    
+                                    if formatted_segment["text"]:  # Only add non-empty segments
+                                        new_segments.append(formatted_segment)
                             
-                            if formatted_segment["text"]:  # Only add non-empty segments
-                                new_segments.append(formatted_segment)
-                                new_text_parts.append(formatted_segment["text"])
-                    
-                    # Update current state with new segments only
-                    if new_segments:
-                        live_transcription_state["current_segments"].extend(new_segments)
-                        
-                        # Rebuild complete text from all segments
-                        complete_text = " ".join(seg["text"] for seg in live_transcription_state["current_segments"])
-                        live_transcription_state["current_text"] = complete_text
-                        
-                        # Send only the new segments to avoid duplication on frontend
-                        formatted_result = {
-                            "text": complete_text,  # Send complete text
-                            "segments": new_segments,  # Send only new segments
-                            "timestamp": time(),
-                            "is_partial": True
-                        }
-                        
-                        logger.info(f"Sending {len(new_segments)} new segments, total text length: {len(complete_text)}")
-                        await websocket.send_text(json.dumps(formatted_result))
+                            # Update session state
+                            if new_segments:
+                                session_state["current_segments"].extend(new_segments)
+                                session_state["current_text"] = complete_text
+                                
+                                # Send result to client
+                                formatted_result = {
+                                    "text": complete_text,
+                                    "segments": new_segments,  # Send only new segments
+                                    "timestamp": current_time,
+                                    "is_partial": True,
+                                    "session_id": session_id,
+                                    "chunk_id": chunk_id
+                                }
+                                
+                                await websocket.send_text(json.dumps(formatted_result))
+                                logger.info(f"Session {session_id}: Sent {len(new_segments)} new segments from chunk {chunk_id}")
+                                
+                                last_update_time = current_time
+                                consecutive_empty_results = 0
+                            else:
+                                consecutive_empty_results += 1
+                        else:
+                            consecutive_empty_results += 1
+                    else:
+                        # Old chunk, ignore
+                        consecutive_empty_results += 1
+                else:
+                    consecutive_empty_results += 1
+                
+                # If no results for a while, send a heartbeat
+                if time() - last_update_time > 10.0:
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "heartbeat": True, 
+                            "session_id": session_id,
+                            "timestamp": time()
+                        }))
+                        last_update_time = time()
+                    except:
+                        logger.info(f"Failed to send heartbeat to session {session_id}, connection likely closed")
+                        break
                 
                 # Small delay to prevent overwhelming the connection
                 await asyncio.sleep(0.1)
                 
             except Exception as e:
-                logger.error(f"Error processing transcription result: {e}")
+                logger.error(f"Error processing transcription result for session {session_id}: {e}")
                 await asyncio.sleep(0.5)  # Longer delay on error
                 
     except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
+        logger.info(f"WebSocket client disconnected: {session_id}")
     except Exception as e:
-        logger.error(f"Error in WebSocket connection: {e}")
+        logger.error(f"Error in WebSocket connection {session_id}: {e}")
         try:
-            await websocket.send_text(json.dumps({"error": str(e)}))
+            await websocket.send_text(json.dumps({"error": str(e), "session_id": session_id}))
         except:
             pass
     finally:
-        # Cleanup
-        logger.info("Cleaning up WebSocket connection")
-        live_transcription_state["is_active"] = False
-        live_transcription_state["processed_segments"] = set()
-        live_transcription_state["current_text"] = ""
-        live_transcription_state["current_segments"] = []
+        # Cleanup session
+        logger.info(f"Cleaning up WebSocket session: {session_id}")
         
-        transcriber = live_transcription_state.get("transcriber")
-        if transcriber:
-            try:
-                transcriber.stop()
-            except Exception as e:
-                logger.error(f"Error stopping transcriber: {e}")
-            live_transcription_state["transcriber"] = None
+        if session_id in live_transcription_sessions:
+            session_state = live_transcription_sessions[session_id]
+            session_state["is_active"] = False
+            
+            # Stop transcriber if it exists
+            transcriber = session_state.get("transcriber")
+            if transcriber:
+                try:
+                    transcriber.stop()
+                    logger.info(f"Transcriber stopped for session {session_id}")
+                except Exception as e:
+                    logger.error(f"Error stopping transcriber for session {session_id}: {e}")
+            
+            # Remove session from global dict
+            del live_transcription_sessions[session_id]
         
         try:
             await websocket.close()
         except:
             pass
+        
+        logger.info(f"Session {session_id} cleanup completed")
 
 @app.post("/api/transcribe-live-chunk")
 async def transcribe_live_audio_chunk_endpoint(file: UploadFile = File(...)):

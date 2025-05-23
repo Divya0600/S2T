@@ -17,21 +17,12 @@ const Icon = (icon: keyof typeof LucideIcons, size = 20, className = '') => {
   return LucideIcon ? <LucideIcon size={size} className={className} /> : null;
 };
 
-// No need for LucideIcon type with direct imports
-
 const API_URL = 'http://localhost:8000';
-const LIVE_CHUNK_INTERVAL_MS = 3000; // Interval for sending live audio chunks (in milliseconds)
 
 interface ActionItem {
   task: string;
   assignee: string;
 }
-
-// Card props are defined in the Card component file
-
-// Using imported Card component from './components/Card'
-
-// StatusCard props and component are imported from './components/StatusCard'
 
 interface ProgressStepsProps {
   currentStep: number;
@@ -65,6 +56,7 @@ function App() {
   const transcriber = useTranscriber();
   const [currentStep, setCurrentStep] = useState<number>(0);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  
   type ActionItemType = {
     task: string;
     assignee: string;
@@ -82,12 +74,14 @@ function App() {
   const [isScreenRecording, setIsScreenRecording] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
-  // Define a type for transcript segments
+  
+  // Define a type for transcript segments with improved structure
   type TranscriptSegment = {
     text: string, 
     start?: number, 
     end?: number, 
-    timestamp?: [number, number | null]
+    timestamp?: [number, number | null],
+    id?: string  // Add unique ID for better deduplication
   };
   
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
@@ -96,13 +90,13 @@ function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const screenMediaRecorderRef = useRef<MediaRecorder | null>(null);
   const screenAudioChunksRef = useRef<Blob[]>([]);
-  const [isCppLiveActive, setIsCppLiveActive] = useState(false); // For whisper.cpp live transcription mode
   const [uploadedAudioFile, setUploadedAudioFile] = useState<File | null>(null);
-  const totalLiveStreamDurationRef = useRef<number>(0); // Tracks cumulative duration for live transcript timestamps
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const webSocketRef = useRef<WebSocket | null>(null);
   
-  // Audio device state and fetching logic removed as we now use the default system audio device.
+  // Improved WebSocket management
+  const webSocketRef = useRef<WebSocket | null>(null);
+  const webSocketSessionId = useRef<string | null>(null);
+  const isLiveTranscriptionActive = useRef<boolean>(false);
+  const processedSegmentIds = useRef<Set<string>>(new Set());
 
   // Summary Generation - now uses direct response from Ollama API
   const generateSummaryFromAPI = async (transcript: string) => {
@@ -316,32 +310,159 @@ function App() {
   const audioPlayerRef = useRef<HTMLAudioElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  // Improved WebSocket connection management
+  const initializeWebSocketConnection = useCallback(() => {
+    if (webSocketRef.current) {
+      console.log('WebSocket already exists, cleaning up first');
+      cleanupWebSocket();
+    }
 
-  // Helper function to convert HH:MM:SS.mmm to seconds
-  const timeStringToSeconds = (timeStr: string): number => {
-    if (!timeStr || typeof timeStr !== 'string') {
-      console.warn(`Invalid time string input: ${timeStr}`);
-      return 0;
-    }
-    const parts = timeStr.split(':');
-    if (parts.length !== 3) {
-      console.warn(`Invalid time string format: ${timeStr}`);
-      return 0;
-    }
-    try {
-      const h = parseInt(parts[0], 10);
-      const m = parseInt(parts[1], 10);
-      const sMs = parseFloat(parts[2]);
-      if (isNaN(h) || isNaN(m) || isNaN(sMs)) {
-        console.warn(`Non-numeric part in time string: ${timeStr}`);
-        return 0;
+    console.log('Initializing new WebSocket connection');
+    
+    const wsUrl = `ws://localhost:8000/transcriber/ws?engine=faster-whisper`;
+    const ws = new WebSocket(wsUrl);
+    webSocketRef.current = ws;
+    isLiveTranscriptionActive.current = true;
+    
+    // Clear processed segments for new session
+    processedSegmentIds.current.clear();
+    
+    ws.onopen = () => {
+      console.log('WebSocket connection established');
+      // Send configuration
+      ws.send(JSON.stringify({
+        engine: 'faster_whisper',
+        model_name: 'base',
+        language: 'en'
+      }));
+    };
+    
+    ws.onmessage = (event) => {
+      if (!isLiveTranscriptionActive.current) {
+        console.log('Ignoring WebSocket message - transcription not active');
+        return;
       }
-      return (h * 3600) + (m * 60) + sMs;
-    } catch (e) {
-      console.error(`Error parsing time string ${timeStr}:`, e);
-      return 0;
+
+      try {
+        const data = JSON.parse(event.data);
+        
+        // Handle heartbeat messages
+        if (data.heartbeat) {
+          console.log('Received heartbeat from server');
+          return;
+        }
+        
+        // Store session ID if provided
+        if (data.session_id) {
+          webSocketSessionId.current = data.session_id;
+        }
+        
+        if (data.segments && Array.isArray(data.segments)) {
+          console.log(`Received ${data.segments.length} new segments`);
+          
+          // Process new segments with improved deduplication
+          const newValidSegments: TranscriptSegment[] = [];
+          
+          for (const segment of data.segments) {
+            const segmentText = segment.text?.trim();
+            const segmentStart = segment.start || 0;
+            const segmentEnd = segment.end || segmentStart;
+            
+            // Skip empty or very short segments
+            if (!segmentText || segmentText.length < 3) {
+              continue;
+            }
+            
+            // Create a robust unique ID for the segment
+            const segmentId = `${segmentText}_${segmentStart.toFixed(2)}_${segmentEnd.toFixed(2)}`;
+            
+            // Only add if we haven't seen this segment before
+            if (!processedSegmentIds.current.has(segmentId)) {
+              processedSegmentIds.current.add(segmentId);
+              
+              newValidSegments.push({
+                text: segmentText,
+                start: segmentStart,
+                end: segmentEnd,
+                id: segmentId,
+                timestamp: [segmentStart, segmentEnd]
+              });
+            }
+          }
+          
+          // Update state with new segments only
+          if (newValidSegments.length > 0) {
+            setLiveSegments(prevSegments => {
+              const updatedSegments = [...prevSegments, ...newValidSegments];
+              
+              // Sort by start time
+              updatedSegments.sort((a, b) => (a.start || 0) - (b.start || 0));
+              
+              // Update live transcript text
+              const fullText = updatedSegments.map(seg => seg.text).join(' ');
+              setLiveTranscript(fullText);
+              
+              console.log(`Added ${newValidSegments.length} new segments, total: ${updatedSegments.length}`);
+              return updatedSegments;
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error processing WebSocket message:', error);
+      }
+    };
+    
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setError('Connection error during live transcription');
+    };
+    
+    ws.onclose = (event) => {
+      console.log(`WebSocket connection closed: ${event.code} ${event.reason}`);
+      if (isLiveTranscriptionActive.current) {
+        console.log('Unexpected WebSocket closure, cleaning up');
+        cleanupWebSocket();
+      }
+    };
+  }, []);
+
+  const cleanupWebSocket = useCallback(() => {
+    console.log('Cleaning up WebSocket connection');
+    
+    // Mark transcription as inactive immediately
+    isLiveTranscriptionActive.current = false;
+    
+    if (webSocketRef.current) {
+      const ws = webSocketRef.current;
+      
+      // Remove event listeners to prevent unwanted callbacks
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      
+      // Close the connection if it's still open
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ command: 'stop', session_id: webSocketSessionId.current }));
+          ws.close(1000, 'Client initiated cleanup');
+        } catch (error) {
+          console.error('Error sending stop command:', error);
+        }
+      }
+      
+      webSocketRef.current = null;
     }
-  };
+    
+    webSocketSessionId.current = null;
+    console.log('WebSocket cleanup completed');
+  }, []);
+
+  // Effect to cleanup WebSocket on component unmount
+  useEffect(() => {
+    return () => {
+      cleanupWebSocket();
+    };
+  }, [cleanupWebSocket]);
 
   const startAudioRecording = (withLiveTranscript: boolean): void => {
     if (isRecording) {
@@ -351,34 +472,41 @@ function App() {
 
     console.log(`Attempting to start audio recording with live transcript: ${withLiveTranscript}`);
     setError('');
-    audioChunksRef.current = []; // Clear previous full recording chunks
-    setLiveSegments([]);       // Clear previous live segments
-    totalLiveStreamDurationRef.current = 0; // Reset live stream duration
-
-    // Change this to always false - don't use whisper.cpp
-    setIsCppLiveActive(false);
     
-    if (withLiveTranscript) {
-      // Initialize faster-whisper transcription
-      console.log('Using faster-whisper for live transcription');
-      transcriber.setEngine('faster_whisper');
-      
-      // Use WebSocket instead of chunk API
-      startFasterWhisperWebSocket();
-    }
+    // Reset all state for new recording
+    audioChunksRef.current = [];
+    setLiveSegments([]);
+    setLiveTranscript('');
+    processedSegmentIds.current.clear();
     
     setIsLiveMode(withLiveTranscript);
 
+    // Clear previous transcript data
     transcriber.output = undefined;
     setActionItems([]); 
     setSummary('');       
-    setLiveTranscript(''); 
     setCurrentStep(1); 
 
-    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }})
+    // Initialize WebSocket for live transcription if needed
+    if (withLiveTranscript) {
+      console.log('Starting live transcription WebSocket');
+      initializeWebSocketConnection();
+    }
+
+    navigator.mediaDevices.getUserMedia({ 
+      audio: { 
+        echoCancellation: true, 
+        noiseSuppression: true, 
+        channelCount: 1 
+      }
+    })
     .then(stream => {
       console.log('Microphone access granted.');
-      const options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 128000 };
+      const options = { 
+        mimeType: 'audio/webm;codecs=opus', 
+        audioBitsPerSecond: 128000 
+      };
+      
       let recorder;
       try {
         recorder = new MediaRecorder(stream, options);
@@ -386,16 +514,21 @@ function App() {
         console.error('Error creating MediaRecorder:', e);
         setError(`Failed to initialize recording: ${e instanceof Error ? e.message : 'Unknown error'}`);
         stream.getTracks().forEach(track => track.stop());
-        setIsCppLiveActive(false); setIsLiveMode(false); setIsRecording(false);
+        if (withLiveTranscript) {
+          cleanupWebSocket();
+        }
+        setIsLiveMode(false);
+        setIsRecording(false);
         return;
       }
+      
       mediaRecorderRef.current = recorder;
+      streamRef.current = stream;
 
       mediaRecorderRef.current.ondataavailable = (event: BlobEvent) => {
         console.log('[App.tsx] ondataavailable called. Chunk size:', event.data?.size);
         if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data); // Collect full recording
-          // Removed whisper.cpp endpoint call
+          audioChunksRef.current.push(event.data);
         }
       };
 
@@ -403,7 +536,9 @@ function App() {
         console.log('MediaRecorder stopped');
         setIsRecording(false);
         
-        const fullAudioBlob = new Blob(audioChunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'audio/webm' });
+        const fullAudioBlob = new Blob(audioChunksRef.current, { 
+          type: mediaRecorderRef.current?.mimeType || 'audio/webm' 
+        });
         
         if (fullAudioBlob.size > 0) {
           // Save audio for later transcription
@@ -419,12 +554,18 @@ function App() {
         
         // Stop all tracks in the stream
         stream.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+        
+        // Cleanup live transcription if it was active
+        if (withLiveTranscript) {
+          cleanupWebSocket();
+        }
       };
 
       try {
         if (withLiveTranscript) { 
-          mediaRecorderRef.current.start(LIVE_CHUNK_INTERVAL_MS);
-          console.log(`MediaRecorder started for live mode with ${LIVE_CHUNK_INTERVAL_MS}ms timeslice.`);
+          mediaRecorderRef.current.start(3000); // Reduced interval for live mode
+          console.log('MediaRecorder started for live mode with 3000ms timeslice.');
         } else {
           mediaRecorderRef.current.start();
           console.log('MediaRecorder started for standard recording.');
@@ -434,13 +575,18 @@ function App() {
         console.error('Error starting MediaRecorder:', e);
         setError(`Failed to start recording: ${e instanceof Error ? e.message : 'Unknown error'}`);
         stream.getTracks().forEach(track => track.stop());
-        setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+        if (withLiveTranscript) {
+          cleanupWebSocket();
+        }
+        setIsRecording(false);
+        setIsLiveMode(false);
       }
     })
     .catch(err => {
       console.error('Failed to get user media (microphone):', err);
       setError('Could not access microphone. Please check permissions.');
-      setIsRecording(false); setIsCppLiveActive(false); setIsLiveMode(false);
+      setIsRecording(false);
+      setIsLiveMode(false);
     });
   };
 
@@ -482,7 +628,17 @@ function App() {
       console.log('Transcription API response:', result);
       
       if (result.status === 'completed') {
-        setLiveSegments(result.segments || []);
+        // Convert chunks to segments format
+        const segments = result.chunks || result.segments || [];
+        const processedSegments = segments.map((chunk: any, index: number) => ({
+          text: chunk.text || '',
+          start: chunk.start || 0,
+          end: chunk.end || 0,
+          timestamp: [chunk.start || 0, chunk.end || 0],
+          id: `segment_${index}_${chunk.start || 0}`
+        }));
+        
+        setLiveSegments(processedSegments);
         setLiveTranscript(result.transcript || '');
         setCurrentStep(3);
       } else if (result.status === 'error') {
@@ -495,45 +651,6 @@ function App() {
       setError(`Failed to generate transcript: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setIsTranscribing(false);
-      // setIsProcessing(false);
-    }
-  };
-
-  // Add new function for WebSocket connection
-  const startFasterWhisperWebSocket = async () => {
-    try {
-      // Start the transcription service
-      const response = await axios.post(`${API_URL}/transcriber/start`, {
-        model_name: "base",
-        language: "en",
-        engine: "faster_whisper"
-      });
-      
-      // Connect to WebSocket
-      const ws = new WebSocket(`ws://localhost:8000/transcriber/ws`);
-      
-      ws.onopen = () => {
-        ws.send(JSON.stringify({
-          engine: "faster_whisper",
-          model_name: "base",
-          language: "en"
-        }));
-      };
-      
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        console.log('Received transcript from WebSocket:', data);
-        
-        if (data.segments) {
-          setLiveSegments(prev => [...prev, ...data.segments.map((seg: { text: string; start?: number; end?: number }) => ({
-            text: seg.text,
-            start: seg.start,
-            end: seg.end
-          }))]);
-        }
-      };
-    } catch (error) {
-      console.error('Error starting faster-whisper WebSocket:', error);
     }
   };
 
@@ -543,42 +660,56 @@ function App() {
       return;
     }
     
-    console.log(`Starting screen recording. Live transcript: ${withLiveTranscript}, Engine: ${transcriber.engine}`);
+    console.log(`Starting screen recording with live transcript: ${withLiveTranscript}`);
     setIsScreenRecording(true);
     setError('');
+    
+    // Reset state for new recording
     screenAudioChunksRef.current = [];
     setLiveSegments([]);
+    setLiveTranscript('');
+    processedSegmentIds.current.clear();
     
-    // Use faster-whisper for screen recording as well
-    transcriber.setEngine('faster-whisper');
     setIsLiveMode(withLiveTranscript);
 
-    console.log('Starting screen recording. Live transcript:', withLiveTranscript);
+    // Initialize WebSocket for live transcription if needed
+    if (withLiveTranscript) {
+      console.log('Starting live transcription WebSocket for screen recording');
+      initializeWebSocketConnection();
+    }
 
     try {
-      // First request system audio specifically with the displayMedia
+      // Request screen capture with audio
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: 'monitor', frameRate: { ideal: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: { 
+          displaySurface: 'monitor', 
+          frameRate: { ideal: 30 }, 
+          width: { ideal: 1920 }, 
+          height: { ideal: 1080 } 
+        },
         audio: {
-          // Explicitly request system audio capture
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false
         }
       });
 
-      // Check if we actually got system audio tracks
+      // Check if we got system audio tracks
       const hasScreenAudio = displayStream.getAudioTracks().length > 0;
       if (hasScreenAudio) {
         console.log('Successfully captured system audio tracks:', displayStream.getAudioTracks());
       } else {
-        console.warn('No system audio tracks captured. Make sure to enable "Share system audio" in the browser dialog');
+        console.warn('No system audio tracks captured. Make sure to enable "Share system audio"');
         alert('Please make sure you enable "Share system audio" in the browser dialog to capture system sounds.');
       }
 
       // Get microphone audio separately
       const audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        audio: { 
+          echoCancellation: false, 
+          noiseSuppression: false, 
+          autoGainControl: false 
+        }
       });
 
       // Create a combined stream with all tracks
@@ -592,13 +723,14 @@ function App() {
         displayStream.getAudioTracks().forEach(track => combinedStream.addTrack(track));
       }
 
-      console.log('Combined stream for screen recording created. Video:', combinedStream.getVideoTracks().length, 'Audio:', combinedStream.getAudioTracks().length);
+      console.log('Combined stream created. Video:', combinedStream.getVideoTracks().length, 'Audio:', combinedStream.getAudioTracks().length);
 
       const recorderOptions = {
         mimeType: 'video/webm;codecs=vp9,opus',
         videoBitsPerSecond: 3000000, // 3 Mbps for video
         audioBitsPerSecond: 128000,  // 128 kbps for audio
       };
+      
       const screenRecorder = new MediaRecorder(combinedStream, recorderOptions);
       screenMediaRecorderRef.current = screenRecorder;
 
@@ -611,6 +743,7 @@ function App() {
       screenRecorder.onstop = async () => {
         console.log('Screen recorder stopped.');
         setIsScreenRecording(false);
+        
         const videoBlob = new Blob(screenAudioChunksRef.current, { type: 'video/webm' });
         
         if (videoBlob.size > 0) {
@@ -620,28 +753,21 @@ function App() {
           // Create and save the audio URL for playback
           const url = URL.createObjectURL(videoBlob);
           setAudioUrl(url);
-          console.log('Created audio URL for playback:', url);
           
-          // If this was a live transcript, save the live segments to the regular transcript
+          // If this was a live transcript, move to transcript step
           if (withLiveTranscript && liveSegments.length > 0) {
             console.log('Transferring live segments to transcript', liveSegments);
-            setCurrentStep(2); // Move to transcript step
+            setCurrentStep(2);
           }
           
-          // Send the recorded video for transcription
-          if (transcriber && typeof transcriber.transcribeFile === 'function') {
+          // If not live mode, transcribe the file
+          if (!withLiveTranscript) {
             try {
               setIsTranscribing(true);
               const result = await transcriber.transcribeFile(videoFile);
               setIsTranscribing(false);
               console.log('Transcription completed:', result);
-              
-              // Make sure we display the result properly
-              if (withLiveTranscript) {
-                // If we were in live mode, the transcript should stay in the state
-                console.log('Live transcription complete');
-              }
-              setCurrentStep(2); // Move to transcript step
+              setCurrentStep(2);
             } catch (error) {
               console.error('Transcription error:', error);
               setIsTranscribing(false);
@@ -652,170 +778,40 @@ function App() {
           console.warn('No data recorded - blob size is 0');
           setError('Recording failed: No audio data captured');
         }
+        
+        // Stop all tracks in the streams
+        combinedStream.getTracks().forEach(track => track.stop());
+        displayStream.getTracks().forEach(track => track.stop());
+        audioStream.getTracks().forEach(track => track.stop());
+        
+        // Cleanup live transcription if it was active
+        if (withLiveTranscript) {
+          cleanupWebSocket();
+        }
       };
-
-      console.log('MediaRecorder started');
-      
-      // For live mode with screen recording
-      if (withLiveTranscript) {
-        console.log('Live transcription enabled for screen recording');
-        
-        // Create an audio context to extract audio from the screen capture
-        const audioContext = new AudioContext();
-        audioContextRef.current = audioContext;
-        
-        // Create a MediaStreamAudioSourceNode
-        // Feed the audio from our combined stream into the audio context
-        const audioSource = audioContext.createMediaStreamSource(combinedStream);
-        
-        // Create a processor to send audio data to transcription service
-        // Use an analyzer node for better performance (createScriptProcessor is deprecated)
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
-        const processorRef = { current: processor }; // Keep a reference we can access in cleanup
-        
-        // Only process audio when recording is active
-        processor.onaudioprocess = async (e) => {
-          // Check if we're still recording before processing
-          if (!isScreenRecording || !webSocketRef.current) {
-            console.log('Audio processing stopped because recording has ended');
-            
-            // Disconnect the processor to stop processing
-            try {
-              if (processorRef.current) {
-                processorRef.current.disconnect();
-                console.log('Audio processor disconnected');
-              }
-            } catch (err) {
-              console.error('Error disconnecting processor:', err);
-            }
-            return;
-          }
-          
-          // Get audio data
-          const audioData = e.inputBuffer.getChannelData(0);
-          
-          // Convert to format suitable for transcription (16-bit PCM)
-          const pcmData = Int16Array.from(audioData.map(x => x * 0x7FFF));
-          
-          // Send to WebSocket if connected
-          if (webSocketRef.current?.readyState === WebSocket.OPEN) {
-            try {
-              webSocketRef.current.send(pcmData.buffer);
-            } catch (err) {
-              console.error('Error sending audio data:', err);
-              // If we encounter an error sending data, stop processing
-              if (processorRef.current) {
-                processorRef.current.disconnect();
-                console.log('Audio processor disconnected due to error');
-              }
-            }
-          }
-        };
-        
-        // Connect the nodes
-        audioSource.connect(processor);
-        processor.connect(audioContext.destination);
-        
-        // Initialize WebSocket for transcription
-        const ws = new WebSocket(`ws://localhost:8000/transcriber/ws`);
-        webSocketRef.current = ws;
-        
-        ws.onopen = () => {
-          console.log('WebSocket open for screen recording transcription');
-          ws.send(JSON.stringify({
-            engine: 'faster-whisper',
-            model_name: transcriber.model,
-            language: transcriber.language || 'en'
-          }));
-        };
-        
-        // Create a unique ID for this recording session to track segments
-        const sessionId = Date.now().toString();
-        const isRecordingRef = { current: true };
-        
-        // Track the last seen segment to detect new content
-        let lastProcessedSegment: { text: string; start: number; end: number } | null = null;
-        
-        ws.onmessage = (event) => {
-          // First check if we're still recording
-          if (!isRecordingRef.current || !isScreenRecording) {
-            console.log('Ignoring WebSocket message because recording has stopped');
-            return;
-          }
-          
-          try {
-            const data = JSON.parse(event.data);
-            console.log(`Screen recording transcription received (session ${sessionId}):`, data);
-            
-            if (data.segments && Array.isArray(data.segments) && data.segments.length > 0) {
-              // Get the most recent segment from the server
-              const latestSegment = data.segments[data.segments.length - 1];
-              
-              // Skip if this is the same as the last processed segment
-              if (lastProcessedSegment && 
-                  lastProcessedSegment.text === latestSegment.text && 
-                  lastProcessedSegment.start === (latestSegment.start || 0) &&
-                  lastProcessedSegment.end === (latestSegment.end || 0)) {
-                console.log('Skipping duplicate segment:', latestSegment.text);
-                return;
-              }
-              
-              // Only process if we have a new segment
-              const newSegment = {
-                text: latestSegment.text || '',
-                start: latestSegment.start || 0,
-                end: latestSegment.end || 0
-              };
-              
-              // Update our last processed segment
-              lastProcessedSegment = { ...newSegment };
-              
-              // Add the new segment to our state
-              setLiveSegments(prevSegments => {
-                // Only add if this is a new segment
-                const isNewSegment = !prevSegments.some(s => 
-                  s.text === newSegment.text && 
-                  s.start === newSegment.start && 
-                  s.end === newSegment.end
-                );
-                
-                if (isNewSegment) {
-                  console.log('Adding new segment:', newSegment.text);
-                  return [...prevSegments, newSegment];
-                }
-                
-                console.log('Skipping duplicate segment in state update');
-                return prevSegments;
-              });
-            }
-          } catch (err) {
-            console.error('Error processing transcript:', err);
-          }
-        };
-        
-        // Store the isRecordingRef in a ref so we can access it in cleanup
-        const isRecordingRefCurrent = isRecordingRef;
-      }
 
       // Start the screen recorder
       screenRecorder.start(1000); // Collect data every second
+      console.log('Screen MediaRecorder started');
       
     } catch (err) {
       console.error('Error starting screen recording:', err);
       setError('Failed to start screen recording. Check permissions.');
       setIsScreenRecording(false);
+      setIsLiveMode(false);
+      
+      // Cleanup on error
+      if (withLiveTranscript) {
+        cleanupWebSocket();
+      }
     }
   };
 
   const stopScreenRecording = useCallback(() => {
     console.log('Stopping screen recording...');
     
-    // Set recording state to false immediately to prevent further processing
+    // Set recording state to false immediately
     setIsScreenRecording(false);
-    
-    // Create a snapshot of the current segments to preserve them
-    const finalSegments = [...liveSegments];
-    console.log(`Preserving ${finalSegments.length} segments at stop time`);
     
     // Stop the media recorder first
     if (screenMediaRecorderRef.current) {
@@ -823,139 +819,56 @@ function App() {
         screenMediaRecorderRef.current.stop();
         console.log('Screen recorder stopped');
       }
-      
-      // Stop all tracks in the stream to ensure complete disconnection
-      const tracks = screenMediaRecorderRef.current.stream?.getTracks() || [];
-      tracks.forEach(track => {
-        track.stop();
-        console.log(`Stopped track: ${track.kind}`);
-      });
-      
       screenMediaRecorderRef.current = null;
     }
     
-    // Clean up WebSocket immediately to stop receiving messages
-    if (webSocketRef.current) {
-      console.log('Closing WebSocket connection');
-      
-      // First remove all event listeners to prevent any more processing
-      if (webSocketRef.current) {
-        webSocketRef.current.onmessage = null;
-        webSocketRef.current.onerror = null;
-        webSocketRef.current.onclose = null;
-      }
-      
-      if (webSocketRef.current.readyState === WebSocket.OPEN) {
-        // Send a message to inform the server we're stopping
-        try {
-          webSocketRef.current.send(JSON.stringify({ command: 'stop' }));
-          console.log('Sent stop command to WebSocket server');
-        } catch (e) {
-          console.error('Failed to send stop command:', e);
-        }
-        webSocketRef.current.close(1000, 'Client stopped recording');
-      }
-      webSocketRef.current = null;
-    }
+    // Cleanup WebSocket connection
+    cleanupWebSocket();
     
-    // Clean up audio context if it was created
-    if (audioContextRef.current) {
-      console.log('Closing audio context');
-      audioContextRef.current.close()
-        .then(() => console.log('Audio context closed successfully'))
-        .catch(e => console.error('Error closing audio context:', e));
-      audioContextRef.current = null;
-    }
-    
-    // If in live mode, ensure we preserve the final transcript
-    if (isLiveMode) {
-      console.log('Live transcription mode stopped. Final data:', finalSegments);
-      
-      // Explicitly set the final segments to ensure we keep them
-      setTimeout(() => {
-        setLiveSegments(finalSegments);
-        setCurrentStep(2); // Move to transcript step
-      }, 100);
-    }
-    
-    setIsLiveMode(false); // Ensure live mode is turned off
+    setIsLiveMode(false);
     console.log('Screen recording cleanup completed');
-  }, [isLiveMode, liveSegments, screenMediaRecorderRef, webSocketRef, audioContextRef, setCurrentStep]);
+  }, [cleanupWebSocket]);
 
   const stopAudioRecording = (): void => {
     console.log('stopAudioRecording called. Current state:', mediaRecorderRef.current?.state);
+    
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop(); // This will trigger the onstop handler
     } else {
       console.warn('Audio recorder not recording or not initialized.');
       setIsRecording(false);
       setIsLiveMode(false);
+      
       // Stop any active tracks in the stream
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track: MediaStreamTrack) => track.stop());
         streamRef.current = null;
       }
+      
+      // Cleanup WebSocket if active
+      cleanupWebSocket();
     }
   };
 
-  // No redeclaration needed here, we already defined the type and state above
-
   // Effect to handle live segments when they change
   useEffect(() => {
-    // Only process if we have segments
-    if (liveSegments.length > 0) {
+    // Only process if we have segments and live mode is active
+    if (liveSegments.length > 0 && isLiveMode) {
       console.log(`Live segments updated: ${liveSegments.length} segments`);
       
-      // Create a clean, non-repetitive transcript text
-      // First sort segments by start time to ensure proper order
-      const sortedSegments = [...liveSegments].sort((a, b) => 
-        (a.start || 0) - (b.start || 0)
-      );
-      
-      // Then remove duplicate segments with same text (keep the first occurrence)
-      const uniqueSegments: TranscriptSegment[] = [];
-      const textSet = new Set<string>();
-      
-      for (const segment of sortedSegments) {
-        // Skip empty segments
-        if (!segment.text?.trim()) continue;
-        
-        // Use combination of text and timestamp as a unique identifier
-        const key = `${segment.text}-${segment.start || 0}-${segment.end || 0}`;
-        
-        if (!textSet.has(key)) {
-          textSet.add(key);
-          uniqueSegments.push(segment);
-        }
-      }
-      
-      // Join the text with spaces
-      const fullText = uniqueSegments.map(segment => segment.text).join(' ');
-      
-      // Log the unique segments for debugging
-      console.log(`After deduplication: ${uniqueSegments.length} unique segments`);
-      
-      if (transcriber && transcriber.output) {
-        // Update the transcriber output with live segments
+      // Update transcriber output with live segments
+      if (transcriber) {
         transcriber.output = {
-          isBusy: false,
-          text: fullText,
-          chunks: uniqueSegments.map(segment => ({
+          isBusy: isRecording || isScreenRecording,
+          text: liveTranscript,
+          chunks: liveSegments.map(segment => ({
             text: segment.text,
             timestamp: [segment.start || 0, segment.end || 0] as [number, number | null]
           }))
         };
-        
-        // Only move to transcript step if we're not actively recording
-        if (!isScreenRecording && !isRecording) {
-          // Wait a short time to ensure all cleanup is done
-          setTimeout(() => {
-            setCurrentStep(2);
-          }, 100);
-        }
       }
     }
-  }, [liveSegments, transcriber, isScreenRecording, isRecording, setCurrentStep]);
+  }, [liveSegments, liveTranscript, isLiveMode, isRecording, isScreenRecording, transcriber]);
 
   // Save Functions
   const saveSummary = () => {
@@ -1016,8 +929,6 @@ function App() {
             Transform meetings into actionable intelligence with advanced voice recognition.
           </p>
         </div>
-        
-        {/* Audio device configuration section removed - now using system default device */}
       </div>
 
       {/* Main Content */}
@@ -1039,7 +950,7 @@ function App() {
           <StatusCard
             icon={Icon('Users')}
             title="Session Status"
-            value={transcriber.output ? "Active" : "Waiting"}
+            value={isLiveTranscriptionActive.current ? "Live Active" : (transcriber.output ? "Active" : "Waiting")}
           />
         </div>
 
@@ -1090,11 +1001,7 @@ function App() {
                   className="flex flex-col items-center justify-center p-6 border-2 border-gray-200 rounded-xl hover:border-[#5236ab] hover:bg-gray-50 transition-all duration-200"
                   onClick={() => {
                     setIsRecording(true);
-                    if (isLiveMode) {
-                      startAudioRecording(true);
-                    } else {
-                      startAudioRecording(false);
-                    }
+                    startAudioRecording(isLiveMode);
                   }}
                 >
                   {Icon('Mic', 32, "w-8 h-8 mb-2 text-[#5236ab]")}
@@ -1107,11 +1014,7 @@ function App() {
                   className="flex flex-col items-center justify-center p-6 border-2 border-gray-200 rounded-xl hover:border-[#5236ab] hover:bg-gray-50 transition-all duration-200"
                   onClick={() => {
                     setIsScreenRecording(true);
-                    if (isLiveMode) {
-                      startScreenRecording(true);
-                    } else {
-                      startScreenRecording(false);
-                    }
+                    startScreenRecording(isLiveMode);
                   }}
                 >
                   {Icon('Monitor', 32, "w-8 h-8 mb-2 text-[#5236ab]")}
@@ -1120,6 +1023,7 @@ function App() {
                 </button>
               </div>
             )}
+            
             {/* Stop Recording Button when recording is active */}
             {(isRecording || isScreenRecording) && (
               <div className="flex justify-center">
@@ -1139,40 +1043,51 @@ function App() {
               </div>
             )}
             
-            {/* Recording status */}
+            {/* Recording status with connection indicator */}
             {(isRecording || isScreenRecording) && (
-              <div className="flex items-center justify-center mt-2">
-                <div className="w-3 h-3 bg-red-500 rounded-full mr-2 animate-pulse"></div>
-                <span className="text-sm font-medium">
-                  {isRecording ? 'Recording audio...' : 'Recording screen and audio...'}
-                  {isLiveMode && ' with live transcription'}
-                </span>
+              <div className="flex flex-col items-center justify-center mt-2 space-y-2">
+                <div className="flex items-center">
+                  <div className="w-3 h-3 bg-red-500 rounded-full mr-2 animate-pulse"></div>
+                  <span className="text-sm font-medium">
+                    {isRecording ? 'Recording audio...' : 'Recording screen and audio...'}
+                    {isLiveMode && ' with live transcription'}
+                  </span>
+                </div>
+                
+                {/* WebSocket connection status */}
+                {isLiveMode && (
+                  <div className="flex items-center text-xs text-gray-500">
+                    <div className={`w-2 h-2 rounded-full mr-1 ${
+                      isLiveTranscriptionActive.current ? 'bg-green-500' : 'bg-red-500'
+                    }`}></div>
+                    Live transcription: {isLiveTranscriptionActive.current ? 'Connected' : 'Disconnected'}
+                  </div>
+                )}
               </div>
             )}
-            
-            {/* The audio player and generate transcript button will be handled by the Card component below */}
           </div>
         </Card>
 
-        {/* Live Transcript Display */}
+        {/* Live Transcript Display - Improved */}
         {((isRecording || isScreenRecording) && isLiveMode) && (
           <Card title="Live Transcript with Timestamps" icon={Icon('Mic')} fullWidth>
             <div className="max-h-80 overflow-y-auto my-2 p-4 bg-gray-50 rounded-lg">
-              {/* Debug info */}
-              <div className="mb-2 p-2 bg-gray-100 text-xs rounded">
-                <div className="grid grid-cols-2 gap-1">
-                  <div>Live segments: <span className="font-mono">{liveSegments.length || 0}</span></div>
-                  <div>Text length: <span className="font-mono">{liveTranscript?.length || 0}</span></div>
-                  <div>Recording: <span className="font-mono">{isRecording ? 'Yes' : 'No'}</span></div>
-                  <div>Live mode: <span className="font-mono">{isLiveMode ? 'Yes' : 'No'}</span></div>
-                  <div>Engine: <span className="font-mono">{isLiveMode && (isRecording || isScreenRecording) ? 'whisper.cpp (live)' : transcriber.engine}</span></div>
+              {/* Debug info - only show in development */}
+              {process.env.NODE_ENV === 'development' && (
+                <div className="mb-2 p-2 bg-gray-100 text-xs rounded">
+                  <div className="grid grid-cols-2 gap-1">
+                    <div>Live segments: <span className="font-mono">{liveSegments.length || 0}</span></div>
+                    <div>Text length: <span className="font-mono">{liveTranscript?.length || 0}</span></div>
+                    <div>WebSocket: <span className="font-mono">{isLiveTranscriptionActive.current ? 'Connected' : 'Disconnected'}</span></div>
+                    <div>Processed IDs: <span className="font-mono">{processedSegmentIds.current.size}</span></div>
+                  </div>
                 </div>
-              </div>
+              )}
               
               {liveSegments.length > 0 ? (
                 <div className="space-y-2">
                   {liveSegments.map((segment, index) => (
-                    <div key={index} className="border-b border-gray-200 pb-2 last:border-0">
+                    <div key={segment.id || index} className="border-b border-gray-200 pb-2 last:border-0">
                       <div className="text-sm text-gray-500 mb-1">
                         {segment.start !== undefined ? formatTimestamp(segment.start) : '00:00:00'} 
                         {segment.end !== undefined ? ` - ${formatTimestamp(segment.end)}` : ''}
@@ -1181,8 +1096,6 @@ function App() {
                     </div>
                   ))}
                 </div>
-              ) : liveTranscript ? (
-                <div className="whitespace-pre-wrap text-gray-800">{liveTranscript}</div>
               ) : (
                 <div className="text-gray-500 italic flex items-center justify-center h-20">
                   <div className="flex items-center">
@@ -1194,15 +1107,6 @@ function App() {
             </div>
           </Card>
         )}
-
-        {/* Transcript Display - with extra debug information */}
-        <div className="mb-4">
-          <pre className="bg-gray-100 p-2 text-xs">
-            Transcript State: {transcriber.output ? 'Has Data' : 'No Data'}
-            {transcriber.output && `, Text Length: ${transcriber.output.text?.length || 0}`}
-            {transcriber.output && `, Chunks: ${transcriber.output.chunks?.length || 0}`}
-          </pre>
-        </div>
         
         {/* Display audio player when audio is available */}
         {audioUrl && (
@@ -1240,7 +1144,7 @@ function App() {
               <div className="mt-4 flex justify-end space-x-4">
                 <button
                   onClick={handleGenerateSummary}
-                  disabled={isProcessing || isTranscribing} // Also disable if still transcribing
+                  disabled={isProcessing || isTranscribing}
                   className={`flex items-center px-4 py-2 ${
                     (isProcessing || isTranscribing) ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#5236ab] hover:bg-[#4527a0]'
                   } text-white rounded-md transition-colors`}
@@ -1311,12 +1215,11 @@ function App() {
           </Card>
         )}
 
-        {/* Action Items Display - Either from parsed actionItems array or raw HTML */}
+        {/* Action Items Display */}
         {actionItems && (
           <Card title="Action Items" icon={Icon('CheckSquare')} fullWidth className="mb-4">
             <div className="space-y-4">
               {typeof actionItems === 'string' ? (
-                // Display HTML action items or show a message when no items are found
                 <div className="bg-gray-50 p-4 rounded-lg">
                   {actionItems.includes('no specific action items') || actionItems.trim() === '' ? (
                     <div className="text-center py-4">
@@ -1330,7 +1233,6 @@ function App() {
                   )}
                 </div>
               ) : (
-                // Display traditional action items array
                 <>
                   {Array.isArray(actionItems) && actionItems.map((item, index) => (
                     <div 
@@ -1358,8 +1260,6 @@ function App() {
             </div>
           </Card>
         )}
-
-        
 
         {/* Error Display */}
         {error && (

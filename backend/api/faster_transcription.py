@@ -12,6 +12,8 @@ import tempfile
 import wave
 from typing import Optional, Dict, Any, List, Callable, Union
 from faster_whisper import WhisperModel
+from collections import deque
+import difflib
 
 # Configure logging
 logging.basicConfig(
@@ -23,12 +25,13 @@ logger = logging.getLogger(__name__)
 class FasterTranscriber:
     """
     A class to handle real-time audio transcription using the faster-whisper model.
+    Improved version with better deduplication and timestamp management.
     """
     def __init__(
         self,
         model_name: str = "base",
         language: Optional[str] = None,
-        chunk_duration_ms: int = 5000,
+        chunk_duration_ms: int = 3000,  # Reduced chunk size for better real-time performance
         sample_rate: int = 16000,
         channels: int = 1,
         format_type: int = pyaudio.paInt16,
@@ -38,7 +41,6 @@ class FasterTranscriber:
     ):
         """
         Initialize the real-time transcriber using faster-whisper.
-        Simplified to use default audio input device.
         
         Args:
             model_name: Whisper model size ('tiny', 'base', 'small', 'medium', 'large-v3')
@@ -61,23 +63,29 @@ class FasterTranscriber:
         self.compute_type = compute_type
         self.device_type = device_type
         
-        # Track audio processing state
-        self.audio_offset = 0.0  # Track total processed audio time
-        self.last_processed_time = 0.0
-        self.last_audio_chunk = None
-        self.device_index = None  # Will be set in start() to default input device
+        # Audio buffer management
+        self.audio_buffer = deque(maxlen=10)  # Keep last 10 chunks for context
+        self.processed_audio_duration = 0.0  # Track total processed time
+        self.last_transcript = ""  # Keep track of last complete transcript
+        self.all_segments = []  # Store all confirmed segments
+        self.pending_text = ""  # Store text that might be incomplete
+        
+        # Deduplication settings
+        self.similarity_threshold = 0.8  # Threshold for text similarity
+        self.min_segment_length = 3  # Minimum words for a valid segment
         
         # Audio parameters
         self.chunk_samples = int(sample_rate * chunk_duration_ms / 1000)
-        self.chunk_bytes = self.chunk_samples * channels * 2  # 2 bytes per sample for paInt16
+        self.chunk_bytes = self.chunk_samples * channels * 2
         self.chunk_duration_sec = chunk_duration_ms / 1000.0
         
         # State flags
         self.running = False
         self.paused = False
+        self.device_index = None
         
         # Threading and queue for audio processing
-        self.audio_queue = queue.Queue()
+        self.audio_queue = queue.Queue(maxsize=5)  # Limit queue size
         self.result_queue = queue.Queue()
         self.lock = threading.Lock()
         
@@ -113,14 +121,93 @@ class FasterTranscriber:
         logger.info(f"Received signal {sig}, stopping transcription...")
         self.stop()
     
+    def _text_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two text strings."""
+        if not text1 or not text2:
+            return 0.0
+        
+        # Use difflib to calculate similarity
+        similarity = difflib.SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+        return similarity
+    
+    def _is_duplicate_segment(self, new_text: str, new_start: float, new_end: float) -> bool:
+        """Check if a segment is a duplicate of existing segments."""
+        if len(new_text.split()) < self.min_segment_length:
+            return True  # Skip very short segments
+        
+        for segment in self.all_segments:
+            # Check text similarity
+            similarity = self._text_similarity(new_text, segment['text'])
+            
+            # Check temporal overlap
+            time_overlap = (
+                max(0, min(new_end, segment['end']) - max(new_start, segment['start']))
+                / min(new_end - new_start, segment['end'] - segment['start'])
+            )
+            
+            # Consider duplicate if high similarity and some time overlap
+            if similarity > self.similarity_threshold and time_overlap > 0.3:
+                logger.debug(f"Duplicate detected: similarity={similarity:.2f}, overlap={time_overlap:.2f}")
+                return True
+        
+        return False
+    
+    def _merge_overlapping_segments(self, segments: List[Dict]) -> List[Dict]:
+        """Merge segments that have significant overlap."""
+        if not segments:
+            return []
+        
+        merged = []
+        for segment in sorted(segments, key=lambda x: x['start']):
+            if not merged:
+                merged.append(segment)
+                continue
+            
+            last_segment = merged[-1]
+            
+            # Check if segments overlap significantly
+            overlap_start = max(segment['start'], last_segment['start'])
+            overlap_end = min(segment['end'], last_segment['end'])
+            overlap_duration = max(0, overlap_end - overlap_start)
+            
+            segment_duration = segment['end'] - segment['start']
+            last_duration = last_segment['end'] - last_segment['start']
+            
+            # If overlap is significant, merge the segments
+            overlap_ratio = overlap_duration / min(segment_duration, last_duration)
+            
+            if overlap_ratio > 0.5:  # 50% overlap threshold
+                # Merge by extending the time range and choosing the longer text
+                merged_text = segment['text'] if len(segment['text']) > len(last_segment['text']) else last_segment['text']
+                
+                merged[-1] = {
+                    'start': min(segment['start'], last_segment['start']),
+                    'end': max(segment['end'], last_segment['end']),
+                    'text': merged_text,
+                    'confidence': max(segment.get('confidence', 0), last_segment.get('confidence', 0))
+                }
+                logger.debug(f"Merged overlapping segments: {overlap_ratio:.2f} overlap")
+            else:
+                merged.append(segment)
+        
+        return merged
+    
     def start(self):
         """Start audio capture and transcription using the default input device."""
         if self.running:
             logger.warning("Transcription is already running")
             return
-            
+        
+        logger.info("Starting real-time transcription")
         self.running = True
         self.paused = False
+        
+        # Reset state
+        self.audio_buffer.clear()
+        self.processed_audio_duration = 0.0
+        self.last_transcript = ""
+        self.all_segments = []
+        self.pending_text = ""
         
         self.audio = pyaudio.PyAudio()
         
@@ -157,188 +244,196 @@ class FasterTranscriber:
             self.running = False
             raise ValueError(f"Failed to open audio stream with device index {self.device_index}.")
             
-        self.processing_thread = threading.Thread(target=self._process_audio_thread)
-        self.processing_thread.daemon = True
+        self.processing_thread = threading.Thread(target=self._process_audio_thread, daemon=True)
         self.processing_thread.start()
         
-        stream_info = self.stream.get_input_latency()
-        logger.info(f"Audio stream started. Input latency: {stream_info} seconds")
+        logger.info("Audio stream and processing thread started")
     
     def _audio_callback(self, in_data, frame_count, time_info, status):
         """Callback function for the PyAudio stream."""
-        if not self.paused:
+        if not self.paused and self.running:
             try:
-                # Convert audio data to numpy array and add to queue
-                audio_np = np.frombuffer(in_data, dtype=np.int16)
-                self.audio_queue.put(audio_np)
+                # Convert audio data to numpy array
+                audio_np = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                # Add to queue, skip if queue is full to prevent backing up
+                try:
+                    self.audio_queue.put_nowait(audio_np)
+                except queue.Full:
+                    logger.warning("Audio queue full, dropping frame")
+                    
             except Exception as e:
                 logger.error(f"Error in audio callback: {e}")
-        return (in_data, pyaudio.paContinue)
-    
-    def _process_audio_chunk(self, audio_data: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Process a single audio chunk and return transcribed segments with adjusted timestamps.
         
-        Args:
-            audio_data: Numpy array containing the audio data (int16 format)
-            
-        Returns:
-            List of transcribed segments with adjusted timestamps
-        """
-        try:
-            # Calculate chunk duration
-            chunk_duration = len(audio_data) / self.sample_rate
-            
-            # Transcribe the chunk
-            segments, _ = self.model.transcribe(
-                audio_data,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
-            
-            # Process segments and adjust timestamps
-            result_segments = []
-            for segment in segments:
-                result_segments.append({
-                    'start': self.audio_offset + segment.start,
-                    'end': self.audio_offset + segment.end,
-                    'text': segment.text.strip(),
-                    'confidence': segment.avg_logprob
-                })
-            
-            # Update the audio offset for the next chunk
-            self.audio_offset += chunk_duration
-            
-            return result_segments
-            
-        except Exception as e:
-            logger.error(f"Error processing audio chunk: {e}")
-            return []
+        return (in_data, pyaudio.paContinue)
     
     def _process_audio_thread(self):
         """Thread for processing audio chunks and running transcription."""
         logger.info("Audio processing thread started")
         
-        # Buffer for accumulating audio in a sliding window approach
-        audio_buffer = []
-        max_buffer_chunks = 6  # Maximum seconds of audio to keep buffered (~30s with 5s chunks)
-        
-        # Stats for monitoring performance
-        stats = {"transcription_times": [], "overall_times": []}
-        
-        # Keep track of all transcribed segments
-        all_segments = []
-        
-        # Time tracking
-        last_processed_time = time.time()
+        last_process_time = time.time()
         
         while self.running:
-            if not self.paused:
+            try:
+                # Get audio chunk with timeout
                 try:
-                    # Get the next audio chunk from the queue with timeout
-                    audio_data = self.audio_queue.get(block=True, timeout=0.5)
-                    
-                    # Add new audio to buffer
-                    audio_buffer.append(audio_data)
-                    
-                    # Process the buffer if we have enough data or if we're at the end of the stream
-                    if len(audio_buffer) >= max_buffer_chunks or self.audio_queue.empty():
-                        # Concatenate audio chunks for processing
-                        combined_audio = np.concatenate(audio_buffer) if len(audio_buffer) > 1 else audio_buffer[0]
-                        
-                        # Process the audio chunk
-                        start_time = time.time()
-                        segments = self._process_audio_chunk(combined_audio)
-                        processing_time = time.time() - start_time
-                        
-                        if segments:
-                            # Add new segments to our collection
-                            all_segments.extend(segments)
-                            
-                            # Update the transcript text
-                            transcript_text = " ".join(seg["text"] for seg in all_segments if seg["text"])
-                            
-                            # Prepare the result
-                            result = {
-                                "text": transcript_text,
-                                "segments": all_segments,
-                                "is_partial": False,
-                                "processing_time": processing_time
-                            }
-                            
-                            # Put the result in the result queue
-                            self.result_queue.put(result)
-                            
-                            # Call the callback if provided
-                            if self.callback:
-                                self.callback(transcript_text, result)
-                            
-                            # Update stats
-                            stats["transcription_times"].append(processing_time)
-                            stats["overall_times"].append(time.time() - last_processed_time)
-                            last_processed_time = time.time()
-                            
-                            # Log some stats occasionally
-                            if len(stats["transcription_times"]) % 10 == 0:
-                                avg_transcribe = sum(stats["transcription_times"][-10:]) / 10
-                                avg_overall = sum(stats["overall_times"][-10:]) / 10
-                                logger.info(
-                                    f"Avg transcription: {avg_transcribe:.2f}s, "
-                                    f"Avg overall: {avg_overall:.2f}s, "
-                                    f"Buffer size: {len(audio_buffer)}"
-                                )
-                        
-                        # Clear the buffer, keeping the last chunk for overlap if needed
-                        audio_buffer = audio_buffer[-1:] if audio_buffer else []
-                    
-                    self.audio_queue.task_done()
-                    
+                    audio_chunk = self.audio_queue.get(timeout=0.5)
                 except queue.Empty:
-                    # No audio data available, just continue
                     continue
-                    
-                except Exception as e:
-                    logger.error(f"Error in audio processing thread: {e}")
-                    # Add a small delay to prevent tight loops on error
-                    time.sleep(0.1)
-            else:
-                # Paused state - just wait briefly
+                
+                # Add to buffer
+                self.audio_buffer.append(audio_chunk)
+                
+                # Process every few chunks or when buffer is getting full
+                current_time = time.time()
+                if (current_time - last_process_time > 2.0) or len(self.audio_buffer) >= 3:
+                    self._process_accumulated_audio()
+                    last_process_time = current_time
+                
+                self.audio_queue.task_done()
+                
+            except Exception as e:
+                logger.error(f"Error in audio processing thread: {e}")
                 time.sleep(0.1)
+        
+        logger.info("Audio processing thread stopped")
+    
+    def _process_accumulated_audio(self):
+        """Process accumulated audio chunks."""
+        if not self.audio_buffer:
+            return
+        
+        try:
+            # Combine all audio chunks in buffer
+            combined_audio = np.concatenate(list(self.audio_buffer))
+            
+            # Skip if audio is too quiet
+            if np.abs(combined_audio).max() < 0.01:
+                return
+            
+            # Transcribe the combined audio
+            segments, info = self.model.transcribe(
+                combined_audio,
+                language=self.language,
+                beam_size=3,  # Reduced for faster processing
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=300,
+                    speech_pad_ms=100
+                )
+            )
+            
+            # Process segments
+            new_segments = []
+            buffer_duration = len(combined_audio) / self.sample_rate
+            
+            for segment in segments:
+                # Adjust timestamps to global time
+                adjusted_start = self.processed_audio_duration + segment.start
+                adjusted_end = self.processed_audio_duration + segment.end
+                
+                segment_text = segment.text.strip()
+                if not segment_text or len(segment_text.split()) < 2:
+                    continue
+                
+                # Check if this is a duplicate
+                if not self._is_duplicate_segment(segment_text, adjusted_start, adjusted_end):
+                    new_segments.append({
+                        'start': adjusted_start,
+                        'end': adjusted_end,
+                        'text': segment_text,
+                        'confidence': getattr(segment, 'avg_logprob', 0.0)
+                    })
+            
+            # Merge with existing segments and remove overlaps
+            if new_segments:
+                # Add new segments to all segments
+                self.all_segments.extend(new_segments)
+                
+                # Merge overlapping segments
+                self.all_segments = self._merge_overlapping_segments(self.all_segments)
+                
+                # Sort by start time
+                self.all_segments.sort(key=lambda x: x['start'])
+                
+                # Create result
+                full_text = " ".join(seg['text'] for seg in self.all_segments)
+                
+                result = {
+                    "text": full_text,
+                    "segments": new_segments,  # Only send new segments
+                    "all_segments": self.all_segments,  # Send all for context
+                    "timestamp": time.time()
+                }
+                
+                # Put result in queue and call callback
+                self.result_queue.put(result)
+                
+                if self.callback:
+                    self.callback(full_text, result)
+                
+                logger.info(f"Processed {len(new_segments)} new segments, total: {len(self.all_segments)}")
+            
+            # Update processed duration (move forward by half the buffer to maintain overlap)
+            advance_duration = buffer_duration * 0.6  # 60% advance for some overlap
+            self.processed_audio_duration += advance_duration
+            
+            # Keep only the last chunk for next iteration (maintain some overlap)
+            if len(self.audio_buffer) > 1:
+                self.audio_buffer = deque([self.audio_buffer[-1]], maxlen=10)
+            
+        except Exception as e:
+            logger.error(f"Error processing accumulated audio: {e}")
     
     def stop(self):
         """Stop the audio stream and cleanup resources."""
         if not self.running:
+            logger.warning("Transcription is not running")
             return
             
         logger.info("Stopping transcription")
         
         # Set flag to stop threads
         self.running = False
+        self.paused = False
         
-        # Wait for a moment to allow threads to clean up
-        time.sleep(0.5)
+        # Process any remaining audio
+        if self.audio_buffer:
+            try:
+                self._process_accumulated_audio()
+            except Exception as e:
+                logger.error(f"Error processing final audio: {e}")
         
         # Close and clean up audio resources
         try:
             if hasattr(self, 'stream') and self.stream:
                 self.stream.stop_stream()
                 self.stream.close()
+                logger.info("Audio stream stopped")
             
             if hasattr(self, 'audio') and self.audio:
                 self.audio.terminate()
+                logger.info("PyAudio terminated")
                     
-            logger.info("Audio resources cleaned up")
         except Exception as e:
             logger.error(f"Error cleaning up audio resources: {e}")
             
+        # Clear queues
+        try:
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+                self.audio_queue.task_done()
+        except:
+            pass
+            
         # Wait for processing thread to complete
         if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():
-            self.processing_thread.join(timeout=2.0)
+            self.processing_thread.join(timeout=3.0)
             logger.info("Processing thread joined")
+        
+        logger.info("Transcription stopped successfully")
     
-    def get_latest_result(self, block: bool = True, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    def get_latest_result(self, block: bool = False, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """
         Get the latest transcription result.
         
@@ -351,25 +446,35 @@ class FasterTranscriber:
         """
         try:
             if block:
-                result = self.result_queue.get(block=True, timeout=timeout)
-                if result and self.callback:
-                    self.callback(result["text"], result)
-                return result
+                return self.result_queue.get(block=True, timeout=timeout)
             else:
-                result = self.result_queue.get_nowait()
-                if result and self.callback:
-                    self.callback(result["text"], result)
-                return result
+                return self.result_queue.get_nowait()
         except queue.Empty:
             return None
     
+    def pause(self):
+        """Pause transcription without stopping the audio stream."""
+        logger.info("Pausing transcription")
+        self.paused = True
+    
+    def resume(self):
+        """Resume transcription after pausing."""
+        logger.info("Resuming transcription")
+        self.paused = False
+    
     def reset(self):
-        """
-        Reset the transcriber state, clearing any buffered audio and results.
-        This is useful when starting a new transcription session.
-        """
+        """Reset the transcriber state, clearing any buffered audio and results."""
         with self.lock:
-            # Clear any pending audio data
+            logger.info("Resetting transcriber state")
+            
+            # Clear buffers
+            self.audio_buffer.clear()
+            self.all_segments = []
+            self.last_transcript = ""
+            self.pending_text = ""
+            self.processed_audio_duration = 0.0
+            
+            # Clear queues
             while not self.audio_queue.empty():
                 try:
                     self.audio_queue.get_nowait()
@@ -377,17 +482,11 @@ class FasterTranscriber:
                 except queue.Empty:
                     break
                     
-            # Clear any pending results
             while not self.result_queue.empty():
                 try:
                     self.result_queue.get_nowait()
                 except queue.Empty:
                     break
-                
-            # Reset state variables
-            self.audio_offset = 0.0
-            self.last_processed_time = 0.0
-            self.last_audio_chunk = None
     
     def _transcribe_internal(self, file_path):
         """Internal method to transcribe a file."""
@@ -452,3 +551,32 @@ class FasterTranscriber:
         except Exception as e:
             logger.error(f"Error in transcribe_file: {e}", exc_info=True)
             raise
+
+
+# Singleton instance for application-wide use
+_transcriber_instance = None
+
+def get_transcriber(config=None):
+    """
+    Get or create the global transcriber instance.
+    
+    Args:
+        config: Optional configuration dictionary to initialize the transcriber
+        
+    Returns:
+        The global FasterTranscriber instance
+    """
+    global _transcriber_instance
+    
+    if _transcriber_instance is None and config is not None:
+        # Handle device parameter for backward compatibility
+        if 'device_index' in config and 'device' not in config:
+            config['device'] = config.pop('device_index')
+        
+        # Remove 'engine' parameter as it's not supported by FasterTranscriber
+        config_copy = config.copy()
+        config_copy.pop('engine', None)
+            
+        _transcriber_instance = FasterTranscriber(**config_copy)
+    
+    return _transcriber_instance
